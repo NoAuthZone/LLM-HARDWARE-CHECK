@@ -274,6 +274,4 @@ instead of an error per model. Certificate checks are never switched off.
 Issues and pull requests are welcome, especially for new chip/GPU table entries, more developer/country rules,
 and provider-API changes. The code is a single readable file; there are no build steps.
 
-## License
 
-Add a license file of your choice (for example MIT) before publishing.
