@@ -13,7 +13,7 @@ The script
   2. searches the provider for models (or checks a specific model),
   3. reads the real file sizes per quantization,
   4. estimates the total memory need (weights + KV cache + overhead),
-  5. classifies every variant: GPU full / Partial offload / CPU only / Too large.
+  5. classifies every variant: GPU full / MoE offload / Partial offload / CPU only / Too large.
 
 No third-party dependencies: runs on Python 3.9+ (standard library only).
 Optional: environment variable HF_TOKEN for private/gated Hugging Face repos.
@@ -74,15 +74,17 @@ have no officially documented search API; if the search fails, use --repo.
 
 from __future__ import annotations
 
-__version__ = "2.5.1"
+__version__ = "2.7.0"
 
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -102,7 +104,7 @@ OVERHEAD_GB = 1.0          # runtime overhead (CUDA context, buffers)
 OS_RESERVE_GB = {"macos": 6.0, "windows": 8.0, "linux": 3.0}
 GPU_RESERVE_GB = {"macos": 0.0, "windows": 1.0, "linux": 0.5}   # desktop/driver with a dedicated GPU
 OS_LABEL = {"macos": "macOS", "windows": "Windows", "linux": "Linux"}
-SETTINGS = {"os": None, "reserve": None, "mac_limit": "reserve", "ollama_ctx": "std", "live": False}   # set in main()
+SETTINGS = {"os": None, "reserve": None, "mac_limit": "reserve", "ollama_ctx": "std", "live": False, "ram_bw": None}   # set in main()
 Q4_GB_PER_B = 0.57         # fallback: GB per billion parameters at about Q4
 
 QUANT_RE = re.compile(r"(I?Q\d(?:_[A-Z0-9]+)*|NVFP4|MXFP4|BF16|F16|F32)", re.IGNORECASE)
@@ -511,10 +513,69 @@ def cached(key, producer):
     return value
 
 
+# ------------------------------------------------------------------ TLS -----
+SSL_CTX = None
+SSL_NOTE = ""
+
+
+def _verify_paths_ok():
+    p = ssl.get_default_verify_paths()
+    if p.cafile and os.path.isfile(p.cafile):
+        return True
+    return bool(p.capath and os.path.isdir(p.capath) and os.listdir(p.capath))
+
+
+def ssl_setup(ca_bundle=None):
+    """TLS context for all requests. Certificate checks always stay on.
+    --ca-bundle / SSL_CERT_FILE: own CA file (e.g. a company or intercepting proxy CA).
+    Python from python.org on macOS ships without CA certificates until "Install Certificates.command" was run;
+    then the certifi package is used if installed, otherwise the macOS system root certificates (via `security`)."""
+    global SSL_CTX, SSL_NOTE
+    if ca_bundle:
+        SSL_CTX = ssl.create_default_context(cafile=ca_bundle)
+        SSL_NOTE = f"CA certificates from {ca_bundle}"
+        return
+    SSL_CTX = ssl.create_default_context()
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR") or _verify_paths_ok():
+        return
+    try:
+        import certifi   # optional, not a requirement
+        SSL_CTX.load_verify_locations(certifi.where())
+        SSL_NOTE = "CA certificates from certifi (Python has no own CA store)"
+        return
+    except (ImportError, OSError, ssl.SSLError):
+        pass
+    if platform.system() == "Darwin" and shutil.which("security"):
+        try:
+            pem = subprocess.check_output(
+                ["security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"], text=True, timeout=20)
+            if "BEGIN CERTIFICATE" in pem:
+                SSL_CTX.load_verify_locations(cadata=pem)
+                SSL_NOTE = "CA certificates from the macOS system keychain (Python has no own CA store)"
+        except (subprocess.SubprocessError, OSError, ssl.SSLError):
+            pass
+
+
+def ssl_hint(errors):
+    """One clear hint instead of a certificate error per model."""
+    if not any("CERTIFICATE_VERIFY_FAILED" in e or "SSLCertVerification" in e or "SSL:" in e for e in errors):
+        return None
+    msg = ("TLS certificate check failed. Typical causes: Python from python.org on macOS without CA certificates "
+           "(run \"/Applications/Python 3.x/Install Certificates.command\" or `pip install certifi`), an intercepting "
+           "proxy such as Burp/ZAP in HTTPS_PROXY (unset it or pass its CA with --ca-bundle FILE), or outdated "
+           "ca-certificates (Linux).")
+    return msg
+
+
+def _urlopen(req, timeout):
+    return urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX)
+
+
 def http_get(url, headers=None, timeout=20):
     def go():
         req = urllib.request.Request(url, headers={**UA, **(headers or {})})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
     if headers and "Authorization" in headers:   # never store requests with a token on disk
         return go()
@@ -529,7 +590,7 @@ def http_json(url, body=None, headers=None, timeout=20, method=None):
             data = json.dumps(body).encode()
             hdrs["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     if headers and "Authorization" in headers:
         return go()
@@ -543,7 +604,8 @@ _GGUF_FIXED = {0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2), 4: ("<I",
                6: ("<f", 4), 7: ("<?", 1), 10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8)}
 _GGUF_WANT = {"block_count", "embedding_length", "context_length", "expert_count", "expert_used_count",
               "attention.head_count", "attention.head_count_kv", "attention.key_length",
-              "attention.value_length", "attention.sliding_window"}
+              "attention.value_length", "attention.sliding_window", "expert_feed_forward_length",
+              "leading_dense_block_count"}
 
 
 def parse_gguf_header(buf):
@@ -621,7 +683,7 @@ def read_gguf_head(url, headers):
     h = {}
     for size in (GGUF_HEAD_BYTES, 8 * GGUF_HEAD_BYTES, 32 * GGUF_HEAD_BYTES):
         req = urllib.request.Request(url, headers={**headers, "Range": f"bytes=0-{size - 1}"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen(req, 30) as resp:
             buf = resp.read(size)
         h = parse_gguf_header(buf)
         # A layer count alone is insufficient: KV/expert fields may follow.
@@ -680,7 +742,9 @@ def meta_from_header(h):
         return {}
     meta = {"arch": h.get("arch"), "layers": h.get("block_count"), "ctx_train": h.get("context_length"),
             "kv_bpt": kv_bytes_per_token(h), "experts": h.get("expert_count"),
-            "experts_used": h.get("expert_used_count"), "swa": swa_of(h)}
+            "experts_used": h.get("expert_used_count"), "swa": swa_of(h),
+            "emb": h.get("embedding_length"), "ffe": h.get("expert_feed_forward_length"),
+            "leading_dense": h.get("leading_dense_block_count")}
     return {k: v for k, v in meta.items() if v}
 
 
@@ -827,7 +891,7 @@ def hf_meta(repo_id):
                     raise
         raise last
 
-    return meta_from_header(fetch() if hf_headers() else cached("GGUFHEAD4 " + url, fetch))
+    return meta_from_header(fetch() if hf_headers() else cached("GGUFHEAD5 " + url, fetch))
 
 
 META_FETCHERS = {"hf": hf_meta}
@@ -956,7 +1020,7 @@ def ollama_head(ns, digest):
     def fetch():
         return read_gguf_head(url, dict(UA))
 
-    return meta_from_header(cached("GGUFHEAD4 " + url, fetch))
+    return meta_from_header(cached("GGUFHEAD5 " + url, fetch))
 
 
 def ollama_variant(name, tag):
@@ -1032,22 +1096,71 @@ def estimate_kv_gb(params_b, size_gb, context: int) -> float:
     return 0.5 * params_b * context / 32768
 
 
-def classify(size_gb: float, kv_gb: float, hw: Hardware):
+ICONS = {"GPU full": "[++]", "MoE offload": "[+M]", "Partial offload": "[+ ]", "CPU only": "[~ ]", "Too large": "[--]"}
+ORDER = {"GPU full": 0, "MoE offload": 1, "Partial offload": 2, "CPU only": 3, "Too large": 4}
+RAM_BW_DEFAULT = 60.0      # GB/s of system RAM actually reached (dual-channel DDR5 desktop); --ram-bandwidth
+MOE_EXPERT_SHARE = 0.9     # share of the file taken by the expert tensors when neither header nor name tell more
+
+
+def moe_split(cand, v, frac):
+    """MoE models: (expert share of the file, share of the experts read per token, number of MoE layers).
+    The expert share is computed from the GGUF header (experts x 3 x embedding x expert FFN x MoE layers);
+    without it the share is derived from the active share in the name (30B-A3B -> 95 %, 80B-A3B -> 98 %).
+    None for dense models."""
+    m = v.meta or cand.meta or {}
+    n, k = m.get("experts"), m.get("experts_used")
+    known = bool(n and k and 0 < k < n)
+    if frac >= 1.0 and not known:
+        return None
+    layers = m.get("layers")
+    moe_layers = layers - (m.get("leading_dense") or 0) if layers else None
+    share = None
+    if known and m.get("emb") and m.get("ffe") and moe_layers and v.params_b:
+        share = n * 3 * m["emb"] * m["ffe"] * moe_layers / (v.params_b * 1e9)
+        if not 0.3 < share < 0.995:
+            share = None
+    if share is None:   # without header data: the smaller the active share, the larger the expert share
+        share = min(0.98, max(0.85, 1 - frac / 2)) if frac < 1.0 else MOE_EXPERT_SHARE
+    # share of the expert weights read per token; from the name: active share minus the always-read dense part
+    ratio = k / n if known else max(0.005, (frac - (1 - share)) / share)
+    return (round(share, 4), round(ratio, 4), moe_layers)
+
+
+def place(size_gb, kv_gb, frac, split, hw, bandwidth, efficiency, moe_ok=True):
+    """Where a variant runs and how fast. Returns (need, verdict, tokens/s, share of the experts on the CPU).
+    MoE offload (llama.cpp --n-cpu-moe): attention, shared parts and KV cache stay in VRAM, as many expert layers
+    as fit as well, the rest of the experts goes to RAM; per token only the active experts are read from RAM.
+    Partial offload: whole layers are split between VRAM and RAM. Both are limited by the RAM bandwidth."""
     need = size_gb + kv_gb + OVERHEAD_GB
     gpu_cap, ram_cap = hw.gpu_cap_gb, hw.ram_cap_gb
+    ram_bw = SETTINGS.get("ram_bw") or RAM_BW_DEFAULT
+    gbs = lambda x: x * 1e9 / GB          # GB/s -> GiB/s
     if gpu_cap > 0 and need <= gpu_cap:
-        return need, "GPU full"
+        return need, "GPU full", estimate_tps(size_gb, frac, bandwidth, efficiency), 0.0
     if hw.unified:
-        return need, "Too large"
+        return need, "Too large", None, 0.0
+    if split and moe_ok and gpu_cap > 0:
+        share, ratio, _ = split
+        exp = size_gb * share
+        dense = size_gb - exp
+        on_cpu = need - gpu_cap
+        if not split[2]:     # layer count unknown: the command can only move all experts (--cpu-moe)
+            on_cpu = exp
+        if dense + kv_gb + OVERHEAD_GB <= gpu_cap and on_cpu <= exp and on_cpu <= ram_cap:
+            c = on_cpu / exp
+            tps = None
+            if bandwidth:
+                t = (dense + exp * ratio * (1 - c)) / gbs(bandwidth) + exp * ratio * c / gbs(ram_bw)
+                tps = efficiency / max(t, 1e-6)
+            return need, "MoE offload", tps, c
     if gpu_cap > 0 and need <= gpu_cap + ram_cap:
-        return need, "Partial offload"
+        g = min(1.0, max(0.0, (gpu_cap - kv_gb - OVERHEAD_GB) / size_gb))
+        active = max(size_gb * frac, 0.1)
+        tps = efficiency / (active * g / gbs(bandwidth) + active * (1 - g) / gbs(ram_bw)) if bandwidth else None
+        return need, "Partial offload", tps, 0.0
     if need <= ram_cap:
-        return need, "CPU only"
-    return need, "Too large"
-
-
-ICONS = {"GPU full": "[++]", "Partial offload": "[+ ]", "CPU only": "[~ ]", "Too large": "[--]"}
-ORDER = {"GPU full": 0, "Partial offload": 1, "CPU only": 2, "Too large": 3}
+        return need, "CPU only", efficiency * gbs(ram_bw) / max(size_gb * frac, 0.1), 0.0
+    return need, "Too large", None, 0.0
 
 
 MOE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b[-_ ]?a(\d+(?:\.\d+)?)\s*b", re.IGNORECASE)
@@ -1098,6 +1211,7 @@ class Row:
     params_b: float | None = None
     ctx: int = 0              # context actually used
     pf: float | None = None   # prompt processing (prefill) in tokens/s
+    ncpu: str | None = None   # MoE offload: value for llama.cpp --n-cpu-moe ("all" = --cpu-moe)
 
 
 def ollama_default_ctx(mem_gb):
@@ -1146,10 +1260,16 @@ def evaluate(cand: Candidate, hw, context, quant_filter, bandwidth=None, efficie
         m = v.meta or cand.meta or {}
         kv_bpt = m.get("kv_bpt")
         kv_gb = kv_gb_for(kv_bpt, m.get("swa"), ctx) if kv_bpt else estimate_kv_gb(v.params_b, v.size_gb, ctx)
-        need, verdict = classify(v.size_gb, kv_gb, hw)
-        tps = estimate_tps(v.size_gb, frac, bandwidth, efficiency) if verdict == "GPU full" else None
+        split = moe_split(cand, v, frac)
+        need, verdict, tps, c = place(v.size_gb, kv_gb, frac, split, hw, bandwidth, efficiency,
+                                      moe_ok=cand.provider != "ollama")
         pf = estimate_prefill(v.size_gb, v.params_b, frac, tflops) if verdict == "GPU full" else None
-        rows.append(Row(v.label, v.size_gb, need, verdict, tps, frac < 1.0, v.params_b, ctx, pf))
+        ncpu = None
+        if verdict == "MoE offload":
+            ncpu = str(min(split[2], math.ceil(c * split[2] + 1e-9))) if split[2] else "all"
+            if split[2] and int(ncpu) >= split[2]:
+                ncpu = "all"
+        rows.append(Row(v.label, v.size_gb, need, verdict, tps, frac < 1.0 or split is not None, v.params_b, ctx, pf, ncpu))
     rows.sort(key=lambda r: (ORDER[r.verdict], -r.size_gb))
     return rows
 
@@ -1180,6 +1300,12 @@ def quant_class(label):
         return "FP"
     m = QBITS_RE.search(label)
     return f"Q{m.group(1)}" if m else "?"
+
+
+def best_moe(rows):
+    """Largest variant that runs with MoE offload (if nothing fits completely)."""
+    pool = [r for r in rows if r.verdict == "MoE offload" and not is_full_precision(r.label)]
+    return max(pool, key=lambda r: r.size_gb) if pool else None
 
 
 def best_fit(rows):
@@ -1409,8 +1535,8 @@ def diff_snapshot(cands, sig, show):
     return msg
 
 
-def make_command(provider, name, label, ctx):
-    """Shell command to download/start a variant."""
+def make_command(provider, name, label, ctx, ncpu=None):
+    """Shell command to download/start a variant (with --n-cpu-moe for MoE offload)."""
     if provider == "ollama":
         lab = (label or "").split(" ")[0]
         if ":" in lab:
@@ -1421,18 +1547,19 @@ def make_command(provider, name, label, ctx):
             ref = f"{name}:{lab}"
         return f"ollama pull {ref}\nOLLAMA_CONTEXT_LENGTH={ctx} ollama run {ref}"
     plain = bool(label) and label != "?" and "/" not in label and re.fullmatch(r"[A-Za-z0-9_.-]+", label) is not None
+    moe = "" if not ncpu else (" --cpu-moe" if ncpu == "all" else f" --n-cpu-moe {ncpu}")
     if provider == "hf":
         if plain and QUANT_RE.fullmatch(label):
-            return f"llama-server -hf {name}:{label} -c {ctx} -ngl 99"
-        return f"hf download {name} --include \"*{label}*\"\n# then: llama-server -m <file>.gguf -c {ctx} -ngl 99"
-    return f"modelscope download --model {name} --include \"*{label}*\"\n# then: llama-server -m <file>.gguf -c {ctx} -ngl 99"
+            return f"llama-server -hf {name}:{label} -c {ctx} -ngl 99{moe}"
+        return f"hf download {name} --include \"*{label}*\"\n# then: llama-server -m <file>.gguf -c {ctx} -ngl 99{moe}"
+    return f"modelscope download --model {name} --include \"*{label}*\"\n# then: llama-server -m <file>.gguf -c {ctx} -ngl 99{moe}"
 
 
 # ---------------------------------------------------------------- Output ----
 def print_top(results, show_tps, only_fit=False, commands=False, ctx=8192):
     """Compact default view: per model the largest variant that fits completely."""
     if only_fit:
-        results = [(c, [r for r in rows if r.verdict in ("GPU full", "Partial offload")]) for c, rows in results]
+        results = [(c, [r for r in rows if r.verdict in ("GPU full", "MoE offload", "Partial offload")]) for c, rows in results]
         results = [(c, rows) for c, rows in results if rows]
     # pure non-text models (embedding, image, audio) are left out of the overview; they stay in the HTML report
     text = [(c, rows) for c, rows in results if not (usage_of(c) and set(usage_of(c)) <= {"Embedding", "Image", "Audio"})]
@@ -1453,7 +1580,7 @@ def print_top(results, show_tps, only_fit=False, commands=False, ctx=8192):
         if not rows:
             continue
         best = best_fit(rows)
-        picked.append((cand, best, best or min(rows, key=lambda r: r.size_gb)))
+        picked.append((cand, best, best or best_moe(rows) or min(rows, key=lambda r: r.size_gb)))
     wn = min(52, max([len(label_of(c)) for c, _, _ in picked] + [5]) + 2)
     wv = min(30, max([len(r.label) for _, _, r in picked] + [7]) + 2)
 
@@ -1474,9 +1601,19 @@ def print_top(results, show_tps, only_fit=False, commands=False, ctx=8192):
             if commands:
                 for line in make_command(cand.provider, cand.name, best.label, best.ctx or ctx).split("\n"):
                     print(f"    $ {line}")
+        elif r.verdict == "MoE offload":
+            tps = f"{r.tps:.0f}" if (show_tps and r.tps) else "-"
+            print(f"{head}{tps:>6}  MoE offload ({'all' if r.ncpu == 'all' else r.ncpu} expert layers in RAM)")
+            if commands:
+                for line in make_command(cand.provider, cand.name, r.label, r.ctx or ctx, r.ncpu).split("\n"):
+                    print(f"    $ {line}")
         else:
             print(f"{head}{'-':>6}  {r.verdict} (smallest variant)")
     print(f"\n{fits} of {len(picked)} models run with at least one variant completely on the GPU / in usable memory.")
+    n_moe = sum(1 for _, b, r in picked if not b and r.verdict == "MoE offload")
+    if n_moe:
+        print(f"{n_moe} more MoE models run with expert offloading (llama.cpp --n-cpu-moe; "
+              f"t/s with {SETTINGS.get('ram_bw') or RAM_BW_DEFAULT:g} GB/s RAM bandwidth, --ram-bandwidth).")
     if hidden:
         print(f"{hidden} non-text models (embedding, image, audio) are hidden here; the HTML report lists them.")
     print("Ctx = context the memory need is calculated for (Ollama: its default by memory; "
@@ -1484,7 +1621,7 @@ def print_top(results, show_tps, only_fit=False, commands=False, ctx=8192):
 
 
 def print_candidate(cand, rows, only_fit, show_tps=False, show_pf=None, commands=False, ctx=8192):
-    rows = [r for r in rows if not only_fit or r.verdict in ("GPU full", "Partial offload")]
+    rows = [r for r in rows if not only_fit or r.verdict in ("GPU full", "MoE offload", "Partial offload")]
     if not rows:
         return False
     label = PROVIDERS[cand.provider][0]
@@ -1519,11 +1656,14 @@ def print_candidate(cand, rows, only_fit, show_tps=False, show_pf=None, commands
             line += f"{t:>10}"
         if show_pf:
             line += f"{(f'~{r.pf:.0f}' if r.pf else '-'):>12}{(f'{show_pf / r.pf:.1f} s' if r.pf else '-'):>10}"
-        print(f"{line}  {ICONS[r.verdict]} {r.verdict}")
+        extra = ""
+        if r.verdict == "MoE offload":
+            extra = " (all expert layers in RAM)" if r.ncpu == "all" else f" ({r.ncpu} expert layers in RAM)"
+        print(f"{line}  {ICONS[r.verdict]} {r.verdict}{extra}")
     if commands:
-        best = best_fit(rows)
+        best = best_fit(rows) or best_moe(rows)
         if best:
-            for line in make_command(cand.provider, cand.name, best.label, best.ctx or ctx).split("\n"):
+            for line in make_command(cand.provider, cand.name, best.label, best.ctx or ctx, best.ncpu).split("\n"):
                 print(f"    $ {line}")
     return True
 
@@ -1531,9 +1671,9 @@ def print_candidate(cand, rows, only_fit, show_tps=False, show_pf=None, commands
 # ------------------------------------------------------------ HTML report ---
 HTML_CSS = """
 :root{color-scheme:light dark;--bg:#f5f6f8;--fg:#1c2127;--muted:#5b6672;--card:#fff;--line:#dde1e6;--accent:#2457d6;
---v0:#0f6b37;--v0b:#ddf2e5;--v1:#7a5200;--v1b:#fcefcf;--v2:#5b4a8a;--v2b:#e9e4f6;--v3:#9a1f1f;--v3b:#fbe2e2}
+--v0:#0f6b37;--v0b:#ddf2e5;--v1:#7a5200;--v1b:#fcefcf;--v2:#5b4a8a;--v2b:#e9e4f6;--v3:#9a1f1f;--v3b:#fbe2e2;--v4:#0b5f6b;--v4b:#d8f0f3}
 @media (prefers-color-scheme:dark){:root{--bg:#121518;--fg:#e7eaee;--muted:#98a2ad;--card:#1b1f24;--line:#2c3239;--accent:#86a9ff;
---v0:#7fe0a6;--v0b:#16342a;--v1:#f1c76b;--v1b:#3a2f12;--v2:#c3b2f0;--v2b:#2c2646;--v3:#ff9f9f;--v3b:#3e1d1d}}
+--v0:#7fe0a6;--v0b:#16342a;--v1:#f1c76b;--v1b:#3a2f12;--v2:#c3b2f0;--v2b:#2c2646;--v3:#ff9f9f;--v3b:#3e1d1d;--v4:#7fd6e0;--v4b:#14343a}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 .wrap{max-width:1000px;margin:0 auto;padding:24px 16px 48px}
@@ -1566,7 +1706,7 @@ section.model{margin:0 0 24px}
 .controls label{display:flex;gap:6px;align-items:center;font-size:.9rem}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.8rem;font-weight:600;white-space:nowrap}
 .badge.v0{background:var(--v0b);color:var(--v0)}.badge.v1{background:var(--v1b);color:var(--v1)}
-.badge.v2{background:var(--v2b);color:var(--v2)}.badge.v3{background:var(--v3b);color:var(--v3)}
+.badge.v2{background:var(--v2b);color:var(--v2)}.badge.v3{background:var(--v3b);color:var(--v3)}.badge.v4{background:var(--v4b);color:var(--v4)}
 .bar{display:inline-block;width:70px;height:8px;background:var(--line);border-radius:4px;margin-right:8px;vertical-align:middle;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--accent)}
 .tag{font-size:.7rem;border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:6px;color:var(--muted)}
@@ -1639,16 +1779,16 @@ const fmtCtx=c=>(c>=1024?Math.round(c/1024)+'k':c)+' context';
 const kv=(p,s,ctx,kb,sw)=>kb?kb*(sw?ctx*sw[1]+Math.min(ctx,sw[0])*(1-sw[1]):ctx)/1073741824:0.5*(p||s/0.57)*ctx/32768;
 const PFEFF=0.3;
 const fmtT=t=>t<10?t.toFixed(1)+' s':(t<120?Math.round(t)+' s':(t/60).toFixed(1)+' min');
-function cmdOf(m,label,cx){
-  const lab=(label||'').split(' ')[0];
+function cmdOf(m,label,cx,ncpu){
+  const lab=(label||'').split(' ')[0], moe=!ncpu?'':(ncpu==='all'?' --cpu-moe':' --n-cpu-moe '+ncpu);
   if(m.p==='ollama'){ const ref=lab.includes(':')?lab:((lab===''||lab==='latest')?m.n:m.n+':'+lab);
     return 'ollama pull '+ref+'\nOLLAMA_CONTEXT_LENGTH='+cx+' ollama run '+ref; }
   const plain=lab&&lab!=='?'&&!lab.includes('/')&&/^[A-Za-z0-9_.-]+$/.test(lab);
-  if(m.p==='hf'){ if(plain&&/^(I?Q\d(_[A-Z0-9]+)*|NVFP4|MXFP4|BF16|F16|F32)$/i.test(lab)) return 'llama-server -hf '+m.n+':'+lab+' -c '+cx+' -ngl 99';
-    return 'hf download '+m.n+' --include "*'+label+'*"\n# then: llama-server -m <file>.gguf -c '+cx+' -ngl 99'; }
-  return 'modelscope download --model '+m.n+' --include "*'+label+'*"\n# then: llama-server -m <file>.gguf -c '+cx+' -ngl 99';
+  if(m.p==='hf'){ if(plain&&/^(I?Q\d(_[A-Z0-9]+)*|NVFP4|MXFP4|BF16|F16|F32)$/i.test(lab)) return 'llama-server -hf '+m.n+':'+lab+' -c '+cx+' -ngl 99'+moe;
+    return 'hf download '+m.n+' --include "*'+label+'*"\n# then: llama-server -m <file>.gguf -c '+cx+' -ngl 99'+moe; }
+  return 'modelscope download --model '+m.n+' --include "*'+label+'*"\n# then: llama-server -m <file>.gguf -c '+cx+' -ngl 99'+moe;
 }
-const copyBtn=(m,label,cx)=>'<button type="button" class="copy" data-cmd="'+esc(cmdOf(m,label,cx))+'" title="Copy download/start command">copy command</button>';
+const copyBtn=(m,label,cx,ncpu)=>'<button type="button" class="copy" data-cmd="'+esc(cmdOf(m,label,cx,ncpu))+'" title="Copy download/start command">copy command</button>';
 const labelBits=l=>{const m=/(?:^|[^a-z0-9])i?q(\d)/i.exec(l); if(m) return +m[1]; if(/f32|fp32/i.test(l)) return 32; if(FP.test(l)) return 16; return null;};
 const calcBits=(size,params)=>{if(!params||params<0.1) return null; const b=size*1.0737*8/params; return b>40?null:b;};
 const bitsOf=(size,params,label)=>{const l=labelBits(label); return l!==null?l:calcBits(size,params);};
@@ -1693,8 +1833,26 @@ function hwOf(i){
 }
 let H=hwOf(D.defaults.mac), lastUni=H.uni, H2=null;
 const verdictOf=(need,hw)=>need<=hw.gpu?'g':(hw.uni?'x':(hw.gpu>0&&need<=hw.gpu+hw.rcap?'p':(need<=hw.rcap?'c':'x')));
-const VLAB={g:'GPU full',p:'Partial offload',c:'CPU only',x:'Too large'};
-const VBADGE={g:['v0','\u2714 GPU full'],p:['v1','\u25d0 Partial offload'],c:['v2','\u25d4 CPU only'],x:['v3','\u2716 too large']};
+/* same model as place() in Python: GPU full / MoE offload (experts partly in RAM) / Partial offload / CPU only */
+function placeV(v,kvg,hw,eff){
+  const size=v[1], frac=v[3], sp=v[7], need=size+kvg+OVER, rbw=(+$('rbw').value||D.defaults.rbw)*1e9/1073741824, bw=hw.bw?hw.bw*1e9/1073741824:0;
+  if(need<=hw.gpu) return {need,vd:'g',tps:bw?eff*bw/Math.max(size*frac,0.1):null,ncpu:null};
+  if(hw.uni) return {need,vd:'x',tps:null,ncpu:null};
+  if(sp&&hw.gpu>0){
+    const exp=size*sp[0], dense=size-exp, onCpu=sp[2]?need-hw.gpu:exp;
+    if(dense+kvg+OVER<=hw.gpu&&onCpu<=exp&&onCpu<=hw.rcap){
+      const c=onCpu/exp; let ncpu='all';
+      if(sp[2]){ const n=Math.min(sp[2],Math.ceil(c*sp[2]-1e-9)); ncpu=n>=sp[2]?'all':String(n); }
+      return {need,vd:'m',tps:bw?eff/((dense+exp*sp[1]*(1-c))/bw+exp*sp[1]*c/rbw):null,ncpu};
+    }
+  }
+  if(hw.gpu>0&&need<=hw.gpu+hw.rcap){ const g=Math.min(1,Math.max(0,(hw.gpu-kvg-OVER)/size)), a=Math.max(size*frac,0.1);
+    return {need,vd:'p',tps:bw?eff/(a*g/bw+a*(1-g)/rbw):null,ncpu:null}; }
+  if(need<=hw.rcap) return {need,vd:'c',tps:eff*rbw/Math.max(size*frac,0.1),ncpu:null};
+  return {need,vd:'x',tps:null,ncpu:null};
+}
+const VLAB={g:'GPU full',m:'MoE offload',p:'Partial offload',c:'CPU only',x:'Too large'};
+const VBADGE={g:['v0','\u2714 GPU full'],m:['v4','\u25d1 MoE offload'],p:['v1','\u25d0 Partial offload'],c:['v2','\u25d4 CPU only'],x:['v3','\u2716 too large']};
 const tierCtx=mem=>mem<24?4096:(mem<48?32768:262144);
 
 function evalHW(hw,ctx,eff,minBits){
@@ -1703,18 +1861,18 @@ function evalHW(hw,ctx,eff,minBits){
   return D.models.map(m=>{
     const rows=m.v.map(v=>{
       const cx=(m.p==='ollama'&&octx==='std')?Math.min(tierCtx(hw.mem),v[5]||m.ct||32768):ctx;
-      const need=v[1]+kv(v[2],v[1],cx,v[4]||m.kb,v[4]?v[6]:m.sw)+OVER, vd=verdictOf(need,hw), fit=vd==='g', bits=bitsOf(v[1],v[2],v[0]);
+      const kvg=kv(v[2],v[1],cx,v[4]||m.kb,v[4]?v[6]:m.sw), P=placeV(v,kvg,hw,eff), need=P.need, vd=P.vd, fit=vd==='g', bits=bitsOf(v[1],v[2],v[0]);
       const cb=calcBits(v[1],v[2]), bshow=cb!==null?cb:bits;
       const qc=qClass(v[0]), okb=!minBits||(bits!==null&&bits>=minBits), qt=qType(v[0]), okQc=!sel.quant.size||sel.quant.has(qc), okQt=!sel.qtype.size||sel.qtype.has(qt), okq=okb&&okQc&&okQt;
       return {label:v[0],size:v[1],params:v[2],frac:v[3],cx,need,vd,fit,bits,bshow,okq,okb,qc,qt,okQc,okQt,ctm:(v[5]||m.ct||0),fp:FP.test(v[0]),
-              tps:(fit&&hw.bw)?eff*(hw.bw*1e9/1073741824)/Math.max(v[1]*v[3],0.1):null,
+              tps:P.tps, ncpu:P.ncpu,
               pf:(fit&&hw.tf)?PFEFF*hw.tf*1e12/(2*(v[2]||v[1]/0.57)*1e9*v[3]):null};
     });
     const ptok=+$('ptok').value||8192;
     rows.forEach(row=>{row.limitOK=variantLimits(row);row.okq=row.okq&&row.limitOK;row.ttft=row.pf?ptok/row.pf:null;});
     const ok=rows.filter(r=>r.okq);
     const best=pick(ok.filter(r=>r.fit));
-    const alt=best?null:(pick(ok.filter(r=>r.vd==='p'))||pick(ok.filter(r=>r.vd==='c')));
+    const alt=best?null:(pick(ok.filter(r=>r.vd==='m'))||pick(ok.filter(r=>r.vd==='p'))||pick(ok.filter(r=>r.vd==='c')));
     return {m,rows,best,alt,vd:best?'g':(alt?alt.vd:'x')};
   });
 }
@@ -1726,8 +1884,8 @@ const NOW=Date.now()/1000;
 const QUALS=[['0','any'],['4','Q4 or better'],['5','Q5 or better'],['8','Q8']];
 const USES=['Chat/Text','Code','Reasoning','Vision','Tools','Math','Embedding','Image','Audio','Uncensored'];
 function sizeOK(p,s){ if(p===null) return false; const [a,b]=s.split('-').map(Number); return p>a&&p<=b; }
-const fitOpts=()=>H.uni?[['g','fits completely'],['x','does not fit']]:['g','p','c','x'].map(k=>[k,VLAB[k]]);
-const fitDefault=()=>H.uni?['g']:(D.defaults.only_fit?['g','p']:['g','p','c']);
+const fitOpts=()=>H.uni?[['g','fits completely'],['x','does not fit']]:['g','m','p','c','x'].map(k=>[k,VLAB[k]]);
+const fitDefault=()=>H.uni?['g']:(D.defaults.only_fit?['g','m','p']:['g','m','p','c']);
 const FACETS=[
   {id:'fit',label:'Verdict',multi:true,opts:fitOpts,test:(r,v)=>r.vd===v},
   {id:'quant',label:'Quantization',multi:true,opts:()=>QOPTS.filter(o=>D.models.some(m=>m.v.some(v=>qClass(v[0])===o[0]))),test:(r,v)=>r.rows.some(x=>x.qc===v&&x.okb&&x.limitOK&&x.okQt)},
@@ -1804,9 +1962,9 @@ function qTypeOpts(){
 const qClass=l=>{ if(FP.test(l)) return 'FP'; const m=/(?:^|[^a-z0-9])i?q(\d)/i.exec(l); return m?'Q'+m[1]:'?'; };
 
 let vsort={k:'size',d:-1}, sdir=1;
-const openKeys=new Set();
+const closedKeys=new Set();   /* variant tables are open by default; this remembers the ones the user closed */
 const VK={label:v=>v.label.toLowerCase(),size:v=>v.size,need:v=>v.need,tps:v=>v.tps===null?-1:v.tps,
-          ttft:v=>v.ttft===null?1e12:v.ttft,vd:v=>'gpcx'.indexOf(v.vd)};
+          ttft:v=>v.ttft===null?1e12:v.ttft,vd:v=>'gmpcx'.indexOf(v.vd)};
 const VDIR={label:1,size:-1,need:1,tps:-1,ttft:1,vd:1};
 const arrow=(on,d)=>on?(d>0?' \u25b2':' \u25bc'):'';
 const vth=(k,t,num)=>'<th class="dim sortable'+(num?' num':'')+'" data-k="'+k+'" title="Sort by '+t+'">'+t+arrow(vsort.k===k,vsort.d)+'</th>';
@@ -1849,7 +2007,7 @@ function variantInner(r){
   const body=rows.length?rows.map(v=>
     '<tr><td>'+esc(dispLabel(v.label))+(v.cx!==+$('ctx').value?' <span class="dim">'+fmtCtx(v.cx)+'</span>':'')+'</td><td class="num">'+v.size.toFixed(1)+' GB</td><td class="num">'+v.need.toFixed(1)+
     ' GB</td><td class="num">'+tpsTxt(v)+'</td><td class="num">'+(v.ttft?fmtT(v.ttft):'\u2013')+'</td><td><span class="badge '+VBADGE[v.vd][0]+'">'+VBADGE[v.vd][1]+
-    '</span></td><td>'+copyBtn(r.m,v.label,v.cx)+'</td></tr>').join(''):'<tr><td colspan="7" class="dim">No variant matches the filter.</td></tr>';
+    '</span>'+(v.vd==='m'?'<div class="dim">'+(v.ncpu==='all'?'all expert layers in RAM':v.ncpu+' expert layers in RAM')+'</div>':'')+'</td><td>'+copyBtn(r.m,v.label,v.cx,v.ncpu)+'</td></tr>').join(''):'<tr><td colspan="7" class="dim">No variant matches the filter.</td></tr>';
   return minHWLine(r.m)+'<table class="sub-table"><thead><tr>'+vth('label','Variant')+vth('size','File',1)+vth('need','Need',1)+vth('tps','Tokens/s',1)+vth('ttft','First token',1)+vth('vd','Verdict')+'<th></th></tr></thead><tbody>'+body+'</tbody></table>';
 }
 
@@ -1873,7 +2031,7 @@ function render(resetShown){
   const fitAll=res.filter(r=>passF(r,['fit'])&&r.best).length, base=res.filter(r=>passF(r,['fit'])).length;
   $('cards').innerHTML=card('Hardware',esc(H.n)+(H.star?' \u2605':''),'RAM '+H.ram+' GB \u00b7 bandwidth '+(H.bw?Math.round(H.bw)+' GB/s':'unknown'))+
     card(H.uni?'Usable unified memory':'Usable GPU memory',H.gpu.toFixed(1)+' GB',H.mac?(LIM==='def'?'macOS default limit (2/3 up to 36 GB, otherwise 3/4)':H.ram+' GB minus '+LIM+' GB for macOS'):esc(H.note||''))+
-    (H.uni?'':card('RAM for offloading',H.rcap.toFixed(1)+' GB','usable alongside the GPU (partial offload, CPU only)'))+
+    (H.uni?'':card('RAM for offloading',H.rcap.toFixed(1)+' GB','usable alongside the GPU (MoE/partial offload, CPU only) \u00b7 '+(+$('rbw').value||D.defaults.rbw)+' GB/s'))+
     card('Matching models',fitAll+' of '+base,'with at least one variant completely in GPU memory')+
     card('Context / efficiency',fmtN(ctx)+' tokens','efficiency '+Math.round(eff*100)+' %')+
     (H2?card('Compared with',esc(H2.n),res.filter(r=>passF(r,['fit'])&&r.c2&&r.c2.best).length+' of '+base+' models fit completely there'):'');
@@ -1894,10 +2052,10 @@ function render(resetShown){
   $('models').tBodies[0].innerHTML=vis.map((r,i)=>{
     const b=r.best||r.alt, m=r.m, nv=r.rows.filter(v=>v.okq).length;
     const bits=b&&b.bshow?'<div class="dim">\u2248 '+b.bshow.toFixed(1)+' bit</div>':'';
-    const tps=(r.best&&b.tps?'<span class="bar"><i style="width:'+Math.round(100*b.tps/maxTps)+'%"></i></span>'+tpsTxt(b):'\u2013')+
+    const tps=(b&&b.tps&&(r.best||b.vd==='m')?'<span class="bar"><i style="width:'+Math.min(100,Math.round(100*b.tps/maxTps))+'%"></i></span>'+tpsTxt(b)+(r.best?'':'<div class="dim">with offload</div>'):(b&&b.tps?'<span class="dim">'+tpsTxt(b)+' (offload)</span>':'\u2013'))+
       (r.best&&b.ttft?'<div class="dim">first token ~'+fmtT(b.ttft)+' @ '+Math.round((+$('ptok').value||8192)/1024)+'k</div>':'');
     const c2=r.c2, b2=c2&&(c2.best||c2.alt);
-    const cmpCell=!H2?'':'<td class="cmpcol">'+(b2?esc(dispLabel(b2.label))+'<div class="dim">'+b2.size.toFixed(1)+' GB'+(c2.best&&b2.tps?' \u00b7 '+tpsTxt(b2)+' t/s':'')+'</div>'+(c2.best?'':'<div><span class="badge '+VBADGE[c2.alt.vd][0]+'">'+VBADGE[c2.alt.vd][1]+'</span></div>'):'<span class="badge v3">\u2716 does not fit</span>')+'</td>';
+    const cmpCell=!H2?'':'<td class="cmpcol">'+(b2?esc(dispLabel(b2.label))+'<div class="dim">'+b2.size.toFixed(1)+' GB'+(b2.tps?' \u00b7 '+tpsTxt(b2)+' t/s':'')+'</div>'+(c2.best?'':'<div><span class="badge '+VBADGE[c2.alt.vd][0]+'">'+VBADGE[c2.alt.vd][1]+'</span></div>'):'<span class="badge v3">\u2716 does not fit</span>')+'</td>';
     const badge=r.best?'':(r.alt?'<div><span class="badge '+VBADGE[r.alt.vd][0]+'">'+VBADGE[r.alt.vd][1]+'</span></div>':'');
     return '<tr><td><div class="nm">'+esc(m.s)+(m.moe?'<span class="tag">MoE</span>':'')+'</div><div class="dim">'+PROV[m.p]+
       (m.d?' \u00b7 '+fmtN(m.d)+' downloads':'')+(m.co?' \u00b7 '+esc(m.co)+' ('+esc(m.og)+')':'')+'</div>'+
@@ -1906,8 +2064,8 @@ function render(resetShown){
       '<td>'+(b?shortLab(b.label)+bits+badge:'<span class="badge v3">\u2716 does not fit</span>')+'</td>'+
       '<td class="num">'+(b?b.size.toFixed(1)+' GB<div class="dim">need '+b.need.toFixed(1)+' GB'+(b.cx!==ctx?' \u00b7 '+fmtCtx(b.cx):'')+'</div>'+(b.ctm&&b.cx>b.ctm?'<div class="dim">\u26a0 model only up to '+fmtCtx(b.ctm)+'</div>':''):'\u2013')+'</td>'+
       '<td class="num">'+tps+'</td>'+cmpCell+
-      '<td>'+(b?'<div>'+copyBtn(m,b.label,b.cx)+'</div>':'')+'<button type="button" class="tog" data-i="'+i+'">'+(openKeys.has(m.p+'|'+m.n)?'\u25be ':'\u25b8 ')+nv+(nv===1?' variant':' variants')+'</button></td></tr>'+
-      '<tr class="drow" data-i="'+i+'" data-k="'+esc(m.p+'|'+m.n)+'"'+(openKeys.has(m.p+'|'+m.n)?'':' hidden')+'><td colspan="7"><div class="vwrap">'+variantInner(r)+'</div></td></tr>';
+      '<td>'+(b?'<div>'+copyBtn(m,b.label,b.cx,b.ncpu)+'</div>':'')+'<button type="button" class="tog" data-i="'+i+'">'+(closedKeys.has(m.p+'|'+m.n)?'\u25b8 ':'\u25be ')+nv+(nv===1?' variant':' variants')+'</button></td></tr>'+
+      '<tr class="drow" data-i="'+i+'" data-k="'+esc(m.p+'|'+m.n)+'"'+(closedKeys.has(m.p+'|'+m.n)?' hidden':'')+'><td colspan="7"><div class="vwrap">'+variantInner(r)+'</div></td></tr>';
   }).join('');
   if(!list.length) $('models').tBodies[0].innerHTML='<tr><td colspan="7" style="padding:28px;text-align:center">No variants match these filters. Try a higher memory budget, a lower speed or context requirement, or reset the filters. Unknown speed/context values are excluded when their filter is active.</td></tr>';
   const activeLimits=[positiveInput('maxmem')?'Memory ≤ '+positiveInput('maxmem')+' GiB':'',positiveInput('mintps')?'Speed ≥ '+positiveInput('mintps')+' tokens/s':'',positiveInput('minctx')?'Supported context ≥ '+fmtN(positiveInput('minctx'))+' tokens':''].filter(Boolean);
@@ -1939,7 +2097,7 @@ function renderOverview(ctx,eff,f){
 
 function exportCsv(){
   const rows=[['Compare hardware','Compare variant','Compare tokens/s','First token (s)','Command','Hardware','Model','Provider','Downloads','Use case','Model family','Country','Developer','Parameters (B)','Verdict','Variant','File GB','Need GB','Tokens/s','Evaluated context','Supported context','Memory limit GiB','Minimum tokens/s','Minimum supported context']];
-  current.forEach(r=>{const b=r.best||r.alt; const c2=r.c2, b2=c2&&(c2.best||c2.alt); rows.push([H2?H2.n:'',b2?b2.label:'',c2&&c2.best&&b2.tps?Math.round(b2.tps):'',b&&b.ttft?b.ttft.toFixed(1):'',b?cmdOf(r.m,b.label,b.cx).replace(/\n/g,' ; '):'',H.n,r.m.n,PROV[r.m.p],r.m.d||'',(r.m.u||[]).join(', '),r.m.families.join(', '),r.m.co||'',r.m.og||'',r.m.params||'',VLAB[r.vd],b?b.label:'',b?b.size.toFixed(1):'',b?b.need.toFixed(1):'',r.best&&b.tps?Math.round(b.tps):'',b?b.cx:'',b&&b.ctm?b.ctm:'',positiveInput('maxmem')||'',positiveInput('mintps')||'',positiveInput('minctx')||'']);});
+  current.forEach(r=>{const b=r.best||r.alt; const c2=r.c2, b2=c2&&(c2.best||c2.alt); rows.push([H2?H2.n:'',b2?b2.label:'',b2&&b2.tps?Math.round(b2.tps):'',b&&b.ttft?b.ttft.toFixed(1):'',b?cmdOf(r.m,b.label,b.cx,b.ncpu).replace(/\n/g,' ; '):'',H.n,r.m.n,PROV[r.m.p],r.m.d||'',(r.m.u||[]).join(', '),r.m.families.join(', '),r.m.co||'',r.m.og||'',r.m.params||'',VLAB[r.vd],b?b.label:'',b?b.size.toFixed(1):'',b?b.need.toFixed(1):'',b&&b.tps?Math.round(b.tps):'',b?b.cx:'',b&&b.ctm?b.ctm:'',positiveInput('maxmem')||'',positiveInput('mintps')||'',positiveInput('minctx')||'']);});
   const csv=rows.map(r=>r.map(c=>'"'+String(typeof c==='string'&&/^[=+@-]/.test(c)?"'"+c:c).replace(/"/g,'""')+'"').join(';')).join('\n');
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));
@@ -1962,14 +2120,14 @@ function exportCsv(){
   const ctxs=[4096,8192,16384,32768,65536,131072];
   if(!ctxs.includes(D.defaults.ctx)){ctxs.push(D.defaults.ctx); ctxs.sort((a,b)=>a-b);}
   $('ctx').innerHTML=ctxs.map(c=>'<option value="'+c+'">'+fmtN(c)+' tokens</option>').join('');
-  $('ctx').value=D.defaults.ctx; if(D.defaults.mintps) $('mintps').value=D.defaults.mintps; $('eff').value=D.defaults.eff; $('octx').value=D.defaults.octx||'std';
+  $('ctx').value=D.defaults.ctx; $('rbw').value=D.defaults.rbw; if(D.defaults.mintps) $('mintps').value=D.defaults.mintps; $('eff').value=D.defaults.eff; $('octx').value=D.defaults.octx||'std';
   const lims=['4','6','8','12']; if(LIM!=='def'&&!lims.includes(LIM)){lims.push(LIM); lims.sort((a,b)=>a-b);}
   $('uni').innerHTML=lims.map(l=>'<option value="'+l+'">RAM minus '+l+' GB for macOS</option>').join('')+'<option value="def">macOS default limit (2/3 or 3/4)</option>'; $('uni').value=LIM;
 })();
 
 const custLabel=()=>{ const i=D.hw.findIndex(x=>x.k==='custom'); if(i<0) return; const t=hwOf(i).n; ['mac','cmp'].forEach(s=>{ const o=$(s).querySelector('option[value="'+i+'"]'); if(o) o.textContent=t; }); };
 ['cvram','cram','cbw','ctf'].forEach(id=>$(id).addEventListener('input',()=>{ custLabel(); render(true); }));
-['mac','cmp','ptok','ctx','octx','eff','sort','maxmem','mintps','minctx'].forEach(id=>$(id).addEventListener('change',()=>{ if(id==='sort') sdir=1; render(true); }));
+['mac','cmp','ptok','ctx','octx','eff','rbw','sort','maxmem','mintps','minctx'].forEach(id=>$(id).addEventListener('change',()=>{ if(id==='sort') sdir=1; render(true); }));
 $('uni').addEventListener('change',()=>{ LIM=$('uni').value; render(true); });
 $('q').addEventListener('input',()=>render(true));
 $('reset').addEventListener('click',()=>{ $('q').value=''; ['maxmem','mintps','minctx'].forEach(id=>$(id).value=''); $('sort').value='size'; sdir=1; resetSel(); render(true); });
@@ -1992,7 +2150,7 @@ $('models').addEventListener('click',e=>{
   const fallback=()=>{const t=document.createElement('textarea'); t.value=text; document.body.appendChild(t); t.select(); try{document.execCommand('copy');}catch(_){} t.remove(); done();};
   if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done,fallback); else fallback();
 });
-const setRow=(tr,open)=>{ tr.hidden=!open; if(open) openKeys.add(tr.dataset.k); else openKeys.delete(tr.dataset.k); const t=tr.previousElementSibling&&tr.previousElementSibling.querySelector('.tog'); if(t) t.textContent=(open?'\u25be ':'\u25b8 ')+t.textContent.slice(2); };
+const setRow=(tr,open)=>{ tr.hidden=!open; if(open) closedKeys.delete(tr.dataset.k); else closedKeys.add(tr.dataset.k); const t=tr.previousElementSibling&&tr.previousElementSibling.querySelector('.tog'); if(t) t.textContent=(open?'\u25be ':'\u25b8 ')+t.textContent.slice(2); };
 $('expand-variants').addEventListener('click',()=>document.querySelectorAll('#models tr.drow').forEach(tr=>setRow(tr,true)));
 $('collapse-variants').addEventListener('click',()=>document.querySelectorAll('#models tr.drow').forEach(tr=>setRow(tr,false)));
 $('models').addEventListener('click',e=>{
@@ -2092,7 +2250,8 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
     models = []
     for cand in cands:
         vs = [[v.label, round(v.size_gb, 2), v.params_b, round(frac, 3),
-               (v.meta or {}).get("kv_bpt"), (v.meta or {}).get("ctx_train"), (v.meta or {}).get("swa")]
+               (v.meta or {}).get("kv_bpt"), (v.meta or {}).get("ctx_train"), (v.meta or {}).get("swa"),
+               (None if cand.provider == "ollama" else moe_split(cand, v, frac))]
               for v, frac in prepare_variants(cand, quant_filter)]
         if vs:
             models.append({"n": cand.name, "s": short_name(cand), "p": cand.provider,
@@ -2111,7 +2270,7 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
     if default is None:
         default = next((i for i, m in enumerate(hwl) if m["n"] == "M4 Max" and m["ram"] == 64), 0)
     data = {"models": models, "hw": hwl, "mine": list(mine) if mine else None,
-            "defaults": {"only_fit": bool(getattr(args, "only_fit", False)), "mac": default, "ctx": args.context, "eff": args.efficiency, "ptok": getattr(args, "prompt_tokens", 8192), "octx": SETTINGS["ollama_ctx"], "mbits": getattr(args, "min_bits", 4) or 0, "mintps": getattr(args, "min_tps", None), "gr": GPU_RESERVE_GB[SETTINGS["os"] or host_os()], "rr": os_reserve(SETTINGS["os"] or host_os()), "lim": "def" if SETTINGS["mac_limit"] == "default" else f"{os_reserve('macos'):g}"}}
+            "defaults": {"only_fit": bool(getattr(args, "only_fit", False)), "mac": default, "ctx": args.context, "eff": args.efficiency, "ptok": getattr(args, "prompt_tokens", 8192), "octx": SETTINGS["ollama_ctx"], "mbits": getattr(args, "min_bits", 4) or 0, "rbw": SETTINGS.get("ram_bw") or RAM_BW_DEFAULT, "mintps": getattr(args, "min_tps", None), "gr": GPU_RESERVE_GB[SETTINGS["os"] or host_os()], "rr": os_reserve(SETTINGS["os"] or host_os()), "lim": "def" if SETTINGS["mac_limit"] == "default" else f"{os_reserve('macos'):g}"}}
     data_json = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
 
     search_txt = esc(", ".join((args.search or []) + (args.repo or [])))
@@ -2131,6 +2290,7 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
            "<label>Prompt length (first-token time)<select id=\"ptok\"></select></label>",
            "<label>Compare with<select id=\"cmp\"></select></label>",
            "<label>Usable Mac memory<select id=\"uni\"></select></label>",
+           "<label>RAM bandwidth for offloading (GB/s)<input id=\"rbw\" type=\"number\" min=\"1\" step=\"any\"></label>",
            "<div id=\"custpanel\" style=\"display:none\"><label>Custom: VRAM (GB)<input id=\"cvram\" type=\"number\" min=\"0\" step=\"any\"></label>"
            "<label>Custom: system RAM (GB)<input id=\"cram\" type=\"number\" min=\"0\" step=\"any\"></label>"
            "<label>Custom: bandwidth (GB/s)<input id=\"cbw\" type=\"number\" min=\"0\" step=\"any\"></label>"
@@ -2147,7 +2307,7 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
            "<option value=\"65536\">65,536 tokens</option><option value=\"131072\">131,072 tokens</option>"
            "<option value=\"262144\">262,144 tokens</option></select></label>",
            "<p id=\"limit-help\" class=\"dim\" style=\"grid-column:1/-1;margin:0\">All variant filters must match the same variant. "
-           "Total memory includes weights, KV cache and runtime overhead. Speed is an estimate for full GPU loading; "
+           "Total memory includes weights, KV cache and runtime overhead. Speed is an estimate (offloaded variants are limited by the RAM bandwidth); "
            "unknown speed or supported context is excluded when its minimum is set. Supported context filters model metadata; "
            "the Context control above sets the context used for the memory calculation.</p>",
            "<div id=\"filter-summary\" role=\"status\" aria-live=\"polite\" class=\"dim\" style=\"grid-column:1/-1\"></div>",
@@ -2161,7 +2321,7 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
            "<div class=\"tablebox tall\"><table id=\"models\"><thead><tr><th data-sk=\"name\" data-t=\"Model\">Model<th class=\"num\" data-sk=\"params\" data-t=\"Parameters\">Parameters"
            "<th>Best variant<th class=\"num\" data-sk=\"size\" data-t=\"File\">File<th class=\"num\" data-sk=\"tps\" data-t=\"Tokens/s (approx.)\">Tokens/s (approx.)<th class=\"cmpcol\" id=\"cmphead\">Compare<th>Details</tr></thead>"
            "<tbody></tbody></table></div><div class=\"more\" id=\"more\"></div>",
-           "<details class=\"fold\" open style=\"margin-top:28px\"><summary><h2>All Mac configurations, including Ultra</h2></summary>"
+           "<details class=\"fold\" style=\"margin-top:28px\"><summary><h2>All Mac configurations, including Ultra</h2></summary>"
            "<p class=\"dim\">Click a row to select that hardware above. The numbers follow the filters; "
            "the largest model in Q4 or higher bit depth is shown.</p>",
            "<div class=\"tablebox\"><table id=\"macs\"><thead><tr><th>Hardware<th class=\"num\">Bandwidth"
@@ -2364,6 +2524,11 @@ def main():
                          "32k from 24, 256k from 48; at most the model context), 'same' = like --context")
     ap.add_argument("--no-meta", action="store_true",
                     help="do not load GGUF metadata (KV cache and MoE are then only estimated)")
+    ap.add_argument("--ca-bundle", metavar="FILE",
+                    help="PEM file with CA certificates (company proxy, Burp/ZAP); default: system/Python store")
+    ap.add_argument("--ram-bandwidth", type=float, metavar="GB/s",
+                    help=f"System RAM bandwidth for offloading speeds (default {RAM_BW_DEFAULT:g}; dual-channel DDR5 about 60-90, "
+                         "workstation/server with 4-12 channels 150-500)")
     ap.add_argument("--advisor", action="store_true",
                     help="Reverse question: smallest Mac and smallest NVIDIA preset each model runs on completely")
     ap.add_argument("--min-tps", type=float, metavar="T/S", help="Advisor/report: minimum tokens/s")
@@ -2389,8 +2554,11 @@ def main():
             ap.error(f"--{name.replace('_', '-')} must be positive and finite")
     global USE_META
     USE_META = not args.no_meta
-    SETTINGS.update(os=args.os, reserve=args.reserve, mac_limit=args.mac_limit, ollama_ctx=args.ollama_ctx, live=args.live)
+    SETTINGS.update(os=args.os, reserve=args.reserve, mac_limit=args.mac_limit, ollama_ctx=args.ollama_ctx, live=args.live, ram_bw=args.ram_bandwidth)
     cache_setup(not args.no_cache, args.cache_ttl, args.refresh)
+    ssl_setup(args.ca_bundle)
+    if SSL_NOTE:
+        print(f"TLS: {SSL_NOTE}")
     if args.no_html:
         args.html = None
     elif not args.html:
@@ -2495,6 +2663,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=6) as pool:   # result order is preserved
         found = list(pool.map(run_search, jobs))
+    net_errors = [repr(exc) for _, exc in found if exc]
     for (term, p), (hits, exc) in zip(jobs, found):
         if exc:
             msg = f"[{PROVIDERS[p][0]}] search '{term}' failed: {exc}"
@@ -2522,6 +2691,10 @@ def main():
     if len(todo) > 8 and sys.stderr.isatty():
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
 
+    hint = ssl_hint(net_errors + [c.error for c in cands if c.error])
+    if hint:
+        notes.append(hint)
+        print("\n" + hint)
     cands, hidden = dedupe_mirrors(cands)
     if hidden:
         notes.append(f"{hidden} repeated provider/repository entries were hidden.")
@@ -2591,7 +2764,10 @@ def main():
     if shown == 0:
         print("\nNo matching variants found.")
 
-    print("\nLegend: [++] GPU full | [+ ] Partial offload (slower) | [~ ] CPU only | [--] Too large")
+    print("\nLegend: [++] GPU full | [+M] MoE offload (experts partly in RAM, llama.cpp --n-cpu-moe) | "
+          "[+ ] Partial offload (slower) | [~ ] CPU only | [--] Too large")
+    if not hw.unified:
+        print(f"Offload speeds assume {SETTINGS.get('ram_bw') or RAM_BW_DEFAULT:g} GB/s RAM bandwidth (--ram-bandwidth).")
     print("Need = file size + estimated KV cache + about 1 GB overhead.")
     if bandwidth:
         print("Tokens/s = rough upper bound: efficiency x bandwidth / active weights (* = MoE, real values usually lower).")
