@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-llm_hardware_check.py (v2.3.0) - checks which LLMs from several providers fit your hardware.
+llm_hardware_check.py (v2.9.0) - checks which LLMs from several providers fit your hardware.
 
 Providers (--provider):
     hf          Hugging Face (GGUF repos)           [default]
@@ -74,7 +74,7 @@ have no officially documented search API; if the search fails, use --repo.
 
 from __future__ import annotations
 
-__version__ = "2.7.0"
+__version__ = "2.9.0"
 
 import argparse
 import hashlib
@@ -104,7 +104,8 @@ OVERHEAD_GB = 1.0          # runtime overhead (CUDA context, buffers)
 OS_RESERVE_GB = {"macos": 6.0, "windows": 8.0, "linux": 3.0}
 GPU_RESERVE_GB = {"macos": 0.0, "windows": 1.0, "linux": 0.5}   # desktop/driver with a dedicated GPU
 OS_LABEL = {"macos": "macOS", "windows": "Windows", "linux": "Linux"}
-SETTINGS = {"os": None, "reserve": None, "mac_limit": "reserve", "ollama_ctx": "std", "live": False, "ram_bw": None}   # set in main()
+SETTINGS = {"os": None, "reserve": None, "mac_limit": "reserve", "ollama_ctx": "std", "live": False, "ram_bw": None,
+            "draft": 0, "accept": 0.7, "draft_cost": 0.05}   # set in main()
 Q4_GB_PER_B = 0.57         # fallback: GB per billion parameters at about Q4
 
 QUANT_RE = re.compile(r"(I?Q\d(?:_[A-Z0-9]+)*|NVFP4|MXFP4|BF16|F16|F32)", re.IGNORECASE)
@@ -532,7 +533,10 @@ def ssl_setup(ca_bundle=None):
     then the certifi package is used if installed, otherwise the macOS system root certificates (via `security`)."""
     global SSL_CTX, SSL_NOTE
     if ca_bundle:
-        SSL_CTX = ssl.create_default_context(cafile=ca_bundle)
+        try:
+            SSL_CTX = ssl.create_default_context(cafile=ca_bundle)
+        except ssl.SSLError as exc:
+            raise SystemExit(f"--ca-bundle: {ca_bundle} is not a valid PEM certificate file ({exc})")
         SSL_NOTE = f"CA certificates from {ca_bundle}"
         return
     SSL_CTX = ssl.create_default_context()
@@ -737,19 +741,31 @@ def kv_gb_for(kv_bpt, swa, ctx):
     return kv_bpt * eff / GB
 
 
+def _num(v):
+    """A single number from a header value. Hybrid architectures store some keys per layer as a list
+    (e.g. expert_count with 0 for dense layers): then the largest value is used."""
+    if isinstance(v, (list, tuple)):
+        vals = [x for x in v if isinstance(x, (int, float)) and not isinstance(x, bool)]
+        return max(vals) if vals else None
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 def meta_from_header(h):
     if not h:
         return {}
-    meta = {"arch": h.get("arch"), "layers": h.get("block_count"), "ctx_train": h.get("context_length"),
-            "kv_bpt": kv_bytes_per_token(h), "experts": h.get("expert_count"),
-            "experts_used": h.get("expert_used_count"), "swa": swa_of(h),
-            "emb": h.get("embedding_length"), "ffe": h.get("expert_feed_forward_length"),
-            "leading_dense": h.get("leading_dense_block_count")}
+    experts_raw = h.get("expert_count")
+    meta = {"arch": h.get("arch"), "layers": _num(h.get("block_count")), "ctx_train": _num(h.get("context_length")),
+            "kv_bpt": kv_bytes_per_token(h), "experts": _num(experts_raw),
+            "experts_used": _num(h.get("expert_used_count")), "swa": swa_of(h),
+            "emb": _num(h.get("embedding_length")), "ffe": _num(h.get("expert_feed_forward_length")),
+            "leading_dense": _num(h.get("leading_dense_block_count"))}
+    if isinstance(experts_raw, (list, tuple)):   # per-layer list: MoE layers = layers with experts
+        meta["moe_layers"] = sum(1 for x in experts_raw if isinstance(x, (int, float)) and x > 0)
     return {k: v for k, v in meta.items() if v}
 
 
 def meta_active_fraction(meta):
-    n, k = meta.get("experts"), meta.get("experts_used")
+    n, k = _num(meta.get("experts")), _num(meta.get("experts_used"))
     if n and k and 0 < k < n:
         return min(1.0, k / n + 0.03)   # selected experts plus shared layers
     return 1.0
@@ -759,24 +775,49 @@ def meta_active_fraction(meta):
 HF_API = "https://huggingface.co/api/models"
 
 
-USAGE_ORDER = ["Chat/Text", "Code", "Reasoning", "Vision", "Tools", "Math", "Embedding",
-               "Image", "Audio", "Uncensored"]
+USAGE_ORDER = ["Chat/Text", "Code", "Reasoning", "Vision", "Tools", "Math",
+               "Medical", "Finance", "Legal", "Science", "Bio/Genomics",
+               "Embedding", "Reranker", "Image gen", "Video gen", "3D gen", "Audio", "Time series", "Uncensored"]
+NON_TEXT = {"Embedding", "Reranker", "Image gen", "Video gen", "3D gen", "Audio", "Time series"}
 _PIPELINE_USAGE = (
     ("text-generation", "Chat/Text"), ("text2text", "Chat/Text"), ("conversational", "Chat/Text"),
     ("chat", "Chat/Text"), ("image-text-to-text", "Vision"), ("visual-question", "Vision"),
     ("image-to-text", "Vision"), ("multi-modal", "Vision"), ("multimodal", "Vision"),
-    ("text-to-image", "Image"), ("image-to-image", "Image"), ("feature-extraction", "Embedding"),
-    ("sentence-similarity", "Embedding"), ("embedding", "Embedding"), ("speech", "Audio"),
-    ("audio", "Audio"), ("text-to-video", "Image"),
+    ("text-to-image", "Image gen"), ("image-to-image", "Image gen"), ("feature-extraction", "Embedding"),
+    ("sentence-similarity", "Embedding"), ("embedding", "Embedding"), ("text-ranking", "Reranker"),
+    ("rerank", "Reranker"), ("speech", "Audio"), ("audio", "Audio"),
+    ("text-to-video", "Video gen"), ("image-to-video", "Video gen"), ("video-to-video", "Video gen"),
+    ("text-to-3d", "3D gen"), ("image-to-3d", "3D gen"), ("time-series", "Time series"),
 )
+_TAG_USAGE = {   # Hugging Face tags / Ollama capabilities
+    "vision": "Vision", "image-text-to-text": "Vision", "thinking": "Reasoning", "reasoning": "Reasoning",
+    "tools": "Tools", "tool-use": "Tools", "function-calling": "Tools", "tool-calling": "Tools",
+    "embedding": "Embedding", "embeddings": "Embedding", "conversational": "Chat/Text",
+    "medical": "Medical", "clinical": "Medical", "healthcare": "Medical", "biomedical": "Medical",
+    "finance": "Finance", "financial": "Finance", "legal": "Legal", "law": "Legal",
+    "science": "Science", "chemistry": "Science", "physics": "Science", "climate": "Science",
+    "biology": "Bio/Genomics", "genomics": "Bio/Genomics", "protein": "Bio/Genomics", "dna": "Bio/Genomics",
+    "reranker": "Reranker", "text-ranking": "Reranker", "time-series-forecasting": "Time series",
+}
 _NAME_USAGE = (
     ("Code", r"coder|codestral|devstral|starcoder|codellama|(^|[-_/.])code([-_.]|$)"),
     ("Reasoning", r"thinking|reason|(^|[-_/.])r1([-_.]|$)|qwq|magistral|[-_.]think"),
     ("Vision", r"(^|[-_/.])(vl|vision|llava|pixtral|moondream|paligemma|minicpm-v|smolvlm|ocr)([-_.]|$)|olmocr"),
     ("Math", r"math"),
-    ("Embedding", r"embed|rerank|(^|[-_/.])(bge|e5|gte|minilm)([-_.]|$)"),
-    ("Image", r"(^|[-_/.])(image|diffusion|flux|sdxl|sd3)([-_.]|$)"),
+    ("Medical", r"medical|meditron|medgemma|medllama|medalpaca|medtron|med42|biomistral|clinic|healthcare|(^|[-_.])health([-_.]|$)|doctor|"
+                r"radiolog|pubmed|huatuo|ultramedical|openbiollm|(^|[-_.])med([-_.]|$)"),
+    ("Finance", r"financ|fingpt|finma|fin-r1|(^|[-_.])fin([-_.]|$)|bloomberg|(^|[-_.])stock|trading|econom"),
+    ("Legal", r"legal|(^|[-_.])law([-_.]|$)|lawyer|saullm|juris"),
+    ("Science", r"scien|chemi|(^|[-_.])chem|physic|astro|galactica|intern-?s1|sciglm|materials"),
+    ("Bio/Genomics", r"genom|biolog|protein|(^|[-_.])(bio|dna|rna|esm\d?)([-_.]|$)|biogpt|biomedlm|evo-?2|single-?cell|molec"),
+    ("Embedding", r"embed|(^|[-_/.])(bge|e5|gte|minilm)([-_.]|$)"),
+    ("Reranker", r"rerank"),
+    ("Image gen", r"(^|[-_/.])(image|diffusion|flux|sdxl|sd3)([-_.]|$)|stable-?diffusion"),
+    ("Video gen", r"text-to-video|(^|[-_.])(t2v|i2v)([-_.]|$)|hunyuanvideo|ltx-?video|cogvideo|mochi|animatediff|"
+                  r"(^|[-_.])wan2?(\.\d)?([-_.]|$)"),
+    ("3D gen", r"(^|[-_.])3d([-_.]|$)|text-to-3d|image-to-3d|trellis|hunyuan3d|triposr|shap-e"),
     ("Audio", r"whisper|(^|[-_/.])(tts|asr|stt)([-_.]|$)|voxtral|speech|audio"),
+    ("Time series", r"time-?series|timesfm|chronos|moirai|lag-llama|tirex"),
     ("Uncensored", r"uncensored|abliterat|heretic|dolphin|no-?refusal"),
     ("Chat/Text", r"instruct|chat|(^|[-_.])it([-_.]|$)|assistant"),
 )
@@ -792,21 +833,15 @@ def derive_usage(name, pipeline=None, tags=None, caps=None, tasks=None):
                 found.add(label)
     meta = [str(t).lower() for t in list(tags or []) + list(caps or [])]
     for t in meta:
-        if t in ("vision", "image-text-to-text"):
-            found.add("Vision")
-        elif t in ("thinking", "reasoning"):
-            found.add("Reasoning")
-        elif t in ("tools", "tool-use", "function-calling", "tool-calling"):
-            found.add("Tools")
-        elif t in ("embedding", "embeddings"):
-            found.add("Embedding")
-        elif t == "conversational":
-            found.add("Chat/Text")
+        if t in _TAG_USAGE:
+            found.add(_TAG_USAGE[t])
     n = str(name).lower().split("/")[-1]   # not the owner (e.g. "Embedding-GGUF/...")
     for label, pattern in _NAME_USAGE:
         if re.search(pattern, n):
             found.add(label)
-    if found & {"Embedding", "Image", "Audio"}:
+    if "Reranker" in found:
+        found.discard("Embedding")   # bge-reranker etc.
+    if found & NON_TEXT:
         found.discard("Chat/Text")  # do not show pure non-text models as chat
     return [u for u in USAGE_ORDER if u in found]
 
@@ -824,8 +859,8 @@ def hf_headers():
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def hf_search(query, limit):
-    params = {"filter": "gguf", "sort": "downloads", "direction": "-1", "limit": limit}
+def hf_search(query, limit, sort="downloads"):
+    params = {"filter": "gguf", "sort": sort, "direction": "-1", "limit": limit}
     if query:
         params["search"] = query
     qs = urllib.parse.urlencode(params)
@@ -983,8 +1018,8 @@ def ollama_card_info(chunk):
     return caps, downloads
 
 
-def ollama_search(query, limit):
-    html = http_get(f"https://ollama.com/search?q={urllib.parse.quote(query)}")
+def ollama_search(query, limit, order=None):
+    html = http_get(f"https://ollama.com/search?q={urllib.parse.quote(query)}" + (f"&o={order}" if order else ""))
     hits = []
     for m in re.finditer(r'href="/library/([^"/?#:]+)"', html):
         if m.group(1) not in [h[0] for h in hits]:
@@ -1108,15 +1143,18 @@ def moe_split(cand, v, frac):
     without it the share is derived from the active share in the name (30B-A3B -> 95 %, 80B-A3B -> 98 %).
     None for dense models."""
     m = v.meta or cand.meta or {}
-    n, k = m.get("experts"), m.get("experts_used")
+    n, k = _num(m.get("experts")), _num(m.get("experts_used"))
     known = bool(n and k and 0 < k < n)
     if frac >= 1.0 and not known:
         return None
-    layers = m.get("layers")
-    moe_layers = layers - (m.get("leading_dense") or 0) if layers else None
+    layers = _num(m.get("layers"))
+    moe_layers = m.get("moe_layers") or (layers - (_num(m.get("leading_dense")) or 0) if layers else None)
+    if moe_layers is not None and moe_layers <= 0:
+        moe_layers = None
+    emb, ffe = _num(m.get("emb")), _num(m.get("ffe"))
     share = None
-    if known and m.get("emb") and m.get("ffe") and moe_layers and v.params_b:
-        share = n * 3 * m["emb"] * m["ffe"] * moe_layers / (v.params_b * 1e9)
+    if known and emb and ffe and moe_layers and v.params_b:
+        share = n * 3 * emb * ffe * moe_layers / (v.params_b * 1e9)
         if not 0.3 < share < 0.995:
             share = None
     if share is None:   # without header data: the smaller the active share, the larger the expert share
@@ -1124,6 +1162,25 @@ def moe_split(cand, v, frac):
     # share of the expert weights read per token; from the name: active share minus the always-read dense part
     ratio = k / n if known else max(0.005, (frac - (1 - share)) / share)
     return (round(share, 4), round(ratio, 4), moe_layers)
+
+
+def spec_factor(frac, split):
+    """Speculative decoding / MTP: a draft (MTP head or small model) proposes N tokens, the large model checks
+    them in one pass and keeps them up to the first wrong one. Expected tokens per pass with acceptance rate a:
+    (1 - a^(N+1)) / (1 - a). Cost per pass: one verification (memory-bound, about one normal pass for dense
+    models; MoE models read more experts for N+1 tokens) plus N draft steps at draft_cost each.
+    Factor < 1 = slower (poor predictions). Off (1.0) unless --draft-tokens is set."""
+    n = SETTINGS.get("draft") or 0
+    if n <= 0:
+        return 1.0
+    a, c = SETTINGS.get("accept", 0.7), SETTINGS.get("draft_cost", 0.05)
+    expected = n + 1 if a >= 1 else (1 - a ** (n + 1)) / (1 - a)
+    verify = 1.0
+    if split or frac < 1.0:
+        share, ratio = (split[0], split[1]) if split else (MOE_EXPERT_SHARE, max(0.005, (frac - 0.1) / 0.9))
+        dense = 1 - share
+        verify = (dense + share * (1 - (1 - ratio) ** (n + 1))) / (dense + share * ratio)   # union of the experts of N+1 tokens
+    return expected / (verify + n * c)
 
 
 def place(size_gb, kv_gb, frac, split, hw, bandwidth, efficiency, moe_ok=True):
@@ -1263,6 +1320,8 @@ def evaluate(cand: Candidate, hw, context, quant_filter, bandwidth=None, efficie
         split = moe_split(cand, v, frac)
         need, verdict, tps, c = place(v.size_gb, kv_gb, frac, split, hw, bandwidth, efficiency,
                                       moe_ok=cand.provider != "ollama")
+        if tps:
+            tps *= spec_factor(frac, split)
         pf = estimate_prefill(v.size_gb, v.params_b, frac, tflops) if verdict == "GPU full" else None
         ncpu = None
         if verdict == "MoE offload":
@@ -1562,7 +1621,7 @@ def print_top(results, show_tps, only_fit=False, commands=False, ctx=8192):
         results = [(c, [r for r in rows if r.verdict in ("GPU full", "MoE offload", "Partial offload")]) for c, rows in results]
         results = [(c, rows) for c, rows in results if rows]
     # pure non-text models (embedding, image, audio) are left out of the overview; they stay in the HTML report
-    text = [(c, rows) for c, rows in results if not (usage_of(c) and set(usage_of(c)) <= {"Embedding", "Image", "Audio"})]
+    text = [(c, rows) for c, rows in results if not (usage_of(c) and set(usage_of(c)) <= NON_TEXT)]
     hidden = len(results) - len(text)
     results = text
     counts = {}
@@ -1610,12 +1669,14 @@ def print_top(results, show_tps, only_fit=False, commands=False, ctx=8192):
         else:
             print(f"{head}{'-':>6}  {r.verdict} (smallest variant)")
     print(f"\n{fits} of {len(picked)} models run with at least one variant completely on the GPU / in usable memory.")
+    if SETTINGS.get("draft"):
+        print(f"t/s include speculative decoding ({SETTINGS['draft']} draft tokens, acceptance {SETTINGS['accept']:.0%}).")
     n_moe = sum(1 for _, b, r in picked if not b and r.verdict == "MoE offload")
     if n_moe:
         print(f"{n_moe} more MoE models run with expert offloading (llama.cpp --n-cpu-moe; "
               f"t/s with {SETTINGS.get('ram_bw') or RAM_BW_DEFAULT:g} GB/s RAM bandwidth, --ram-bandwidth).")
     if hidden:
-        print(f"{hidden} non-text models (embedding, image, audio) are hidden here; the HTML report lists them.")
+        print(f"{hidden} non-text models (embedding, reranker, image/video/3D generation, audio, time series) are hidden here; the HTML report lists them.")
     print("Ctx = context the memory need is calculated for (Ollama: its default by memory; "
           "use --ollama-ctx same to compare all providers at --context).")
 
@@ -1794,7 +1855,7 @@ const calcBits=(size,params)=>{if(!params||params<0.1) return null; const b=size
 const bitsOf=(size,params,label)=>{const l=labelBits(label); return l!==null?l:calcBits(size,params);};
 const dispLabel=l=>l==='?'?'(no quant label)':l;
 const shortLab=l=>'<span title="'+esc(l)+'">'+esc(dispLabel(l).split('/').pop())+'</span>';
-const NONTEXT=new Set(['Embedding','Image','Audio']);
+const NONTEXT=new Set(D.nontext);
 const isNonText=m=>(m.u||[]).length>0&&m.u.every(u=>NONTEXT.has(u));
 let current=[], shown=LIMIT;
 
@@ -1825,7 +1886,7 @@ function hwOf(i){
   if(h.k==='mac'){ const u=usableOf(h.ram); return {i,n:h.n+' \u00b7 '+h.ram+' GB',ram:h.ram,bw:h.bw,tf:h.tf||null,gpu:u,rcap:0,uni:true,mem:u,mac:true,star:!!(D.mine&&D.mine[0].toLowerCase()===h.n.toLowerCase()&&Math.abs(D.mine[1]-h.ram)<0.5)}; }
   if(h.k==='gpu'||h.k==='custom'){
     let vram=h.vram, ram=h.ram, bw=h.bw, tf=h.tf;
-    if(h.k==='custom'){ vram=+$('cvram').value||0; ram=+$('cram').value||0; bw=+$('cbw').value||null; tf=+$('ctf').value||null; }
+    if(h.k==='custom'){ vram=positiveInput('cvram'); ram=positiveInput('cram'); bw=positiveInput('cbw')||null; tf=positiveInput('ctf')||null; }
     const gr=D.defaults.gr, rr=D.defaults.rr;
     return {i,n:h.n+' \u00b7 '+vram+' GB VRAM',ram,bw,tf,gpu:Math.max(0,vram-gr),rcap:Math.max(0,ram-rr),uni:false,mem:vram,note:'VRAM minus '+gr+' GB, RAM minus '+rr+' GB',mac:false,star:false,custom:h.k==='custom'};
   }
@@ -1834,8 +1895,15 @@ function hwOf(i){
 let H=hwOf(D.defaults.mac), lastUni=H.uni, H2=null;
 const verdictOf=(need,hw)=>need<=hw.gpu?'g':(hw.uni?'x':(hw.gpu>0&&need<=hw.gpu+hw.rcap?'p':(need<=hw.rcap?'c':'x')));
 /* same model as place() in Python: GPU full / MoE offload (experts partly in RAM) / Partial offload / CPU only */
-function placeV(v,kvg,hw,eff){
-  const size=v[1], frac=v[3], sp=v[7], need=size+kvg+OVER, rbw=(+$('rbw').value||D.defaults.rbw)*1e9/1073741824, bw=hw.bw?hw.bw*1e9/1073741824:0;
+function specF(v){
+  const n=+$('draft').value||0; if(n<=0) return 1;
+  const a=Math.min(1,positiveInput('accept')||0.7), c=D.defaults.dcost, frac=v[3], sp=v[7];
+  const e=a>=1?n+1:(1-Math.pow(a,n+1))/(1-a); let ver=1;
+  if(sp||frac<1){ const sh=sp?sp[0]:0.9, r=sp?sp[1]:Math.max(0.005,(frac-0.1)/0.9), d=1-sh; ver=(d+sh*(1-Math.pow(1-r,n+1)))/(d+sh*r); }
+  return e/(ver+n*c);
+}
+function placeV(v,kvg,hw,eff,moeOk){
+  const size=v[1], frac=v[3], sp=moeOk===false?null:v[7], need=size+kvg+OVER, rbw=(positiveInput('rbw')||D.defaults.rbw)*1e9/1073741824, bw=hw.bw?hw.bw*1e9/1073741824:0;
   if(need<=hw.gpu) return {need,vd:'g',tps:bw?eff*bw/Math.max(size*frac,0.1):null,ncpu:null};
   if(hw.uni) return {need,vd:'x',tps:null,ncpu:null};
   if(sp&&hw.gpu>0){
@@ -1861,11 +1929,11 @@ function evalHW(hw,ctx,eff,minBits){
   return D.models.map(m=>{
     const rows=m.v.map(v=>{
       const cx=(m.p==='ollama'&&octx==='std')?Math.min(tierCtx(hw.mem),v[5]||m.ct||32768):ctx;
-      const kvg=kv(v[2],v[1],cx,v[4]||m.kb,v[4]?v[6]:m.sw), P=placeV(v,kvg,hw,eff), need=P.need, vd=P.vd, fit=vd==='g', bits=bitsOf(v[1],v[2],v[0]);
+      const kvg=kv(v[2],v[1],cx,v[4]||m.kb,v[4]?v[6]:m.sw), P=placeV(v,kvg,hw,eff,m.p!=='ollama'), need=P.need, vd=P.vd, fit=vd==='g', bits=bitsOf(v[1],v[2],v[0]);
       const cb=calcBits(v[1],v[2]), bshow=cb!==null?cb:bits;
       const qc=qClass(v[0]), okb=!minBits||(bits!==null&&bits>=minBits), qt=qType(v[0]), okQc=!sel.quant.size||sel.quant.has(qc), okQt=!sel.qtype.size||sel.qtype.has(qt), okq=okb&&okQc&&okQt;
       return {label:v[0],size:v[1],params:v[2],frac:v[3],cx,need,vd,fit,bits,bshow,okq,okb,qc,qt,okQc,okQt,ctm:(v[5]||m.ct||0),fp:FP.test(v[0]),
-              tps:P.tps, ncpu:P.ncpu,
+              tps:P.tps?P.tps*specF(v):null, ncpu:P.ncpu,
               pf:(fit&&hw.tf)?PFEFF*hw.tf*1e12/(2*(v[2]||v[1]/0.57)*1e9*v[3]):null};
     });
     const ptok=+$('ptok').value||8192;
@@ -1882,7 +1950,7 @@ const DLS=[['1000','1,000+'],['10000','10,000+'],['100000','100,000+'],['1000000
 const UPDS=[['30','last 30 days'],['90','last 90 days'],['365','last year']];
 const NOW=Date.now()/1000;
 const QUALS=[['0','any'],['4','Q4 or better'],['5','Q5 or better'],['8','Q8']];
-const USES=['Chat/Text','Code','Reasoning','Vision','Tools','Math','Embedding','Image','Audio','Uncensored'];
+const USES=D.uses;
 function sizeOK(p,s){ if(p===null) return false; const [a,b]=s.split('-').map(Number); return p>a&&p<=b; }
 const fitOpts=()=>H.uni?[['g','fits completely'],['x','does not fit']]:['g','m','p','c','x'].map(k=>[k,VLAB[k]]);
 const fitDefault=()=>H.uni?['g']:(D.defaults.only_fit?['g','m','p']:['g','m','p','c']);
@@ -1910,6 +1978,7 @@ function filt(){ return {sort:$('sort').value, minBits:+sel.qual}; }
 function passF(r,skip){
   if(!skip.includes('use')&&!sel.use.size&&isNonText(r.m)) return false;
   if(!r.rows.some(v=>v.okb&&v.limitOK&&(skip.includes('quant')||v.okQc)&&(skip.includes('qtype')||v.okQt))) return false;
+  const minp=positiveInput('minparams'); if(minp&&!(r.m.params>=minp)) return false;
   const q=$('q').value.trim().toLowerCase();
   if(q&&!(r.m.n+' '+PROV[r.m.p]+' '+r.m.families.join(' ')+' '+(r.m.co||'')+' '+(r.m.og||'')+' '+(r.m.u||[]).join(' ')+' '+r.rows.map(v=>v.label).join(' ')).toLowerCase().includes(q)) return false;
   for(const F of FACETS){
@@ -1976,7 +2045,7 @@ LADDER.gpu.sort((a,b)=>D.hw[a].vram-D.hw[b].vram||(D.hw[a].bw||0)-(D.hw[b].bw||0
 const MINMEMO=new Map();
 function minHW(m){
   const ctx=+$('ctx').value, eff=+$('eff').value||0.6, minT=positiveInput('mintps'), octx=$('octx').value, mb=D.defaults.mbits;
-  const key=m.p+'|'+m.n+'|'+ctx+'|'+eff+'|'+minT+'|'+octx+'|'+LIM;
+  const key=m.p+'|'+m.n+'|'+ctx+'|'+eff+'|'+minT+'|'+octx+'|'+LIM+'|'+$('draft').value+'|'+$('accept').value;
   if(MINMEMO.has(key)) return MINMEMO.get(key);
   const out={};
   for(const kind of ['mac','gpu']){
@@ -1988,7 +2057,7 @@ function minHW(m){
         const b=bitsOf(v[1],v[2],v[0]); if(mb&&(b===null||b<mb-0.05)) continue;
         const cx=(m.p==='ollama'&&octx==='std')?Math.min(tierCtx(hw.mem),v[5]||m.ct||32768):ctx;
         const need=v[1]+kv(v[2],v[1],cx,v[4]||m.kb,v[4]?v[6]:m.sw)+OVER; if(need>hw.gpu) continue;
-        const tps=hw.bw?eff*(hw.bw*1e9/1073741824)/Math.max(v[1]*v[3],0.1):null;
+        const tps=hw.bw?eff*(hw.bw*1e9/1073741824)/Math.max(v[1]*v[3],0.1)*specF(v):null;
         if(minT&&(tps===null||tps<minT)) continue;
         if(!best||v[1]>best.size) best={label:v[0],size:v[1],tps};
       }
@@ -2031,7 +2100,7 @@ function render(resetShown){
   const fitAll=res.filter(r=>passF(r,['fit'])&&r.best).length, base=res.filter(r=>passF(r,['fit'])).length;
   $('cards').innerHTML=card('Hardware',esc(H.n)+(H.star?' \u2605':''),'RAM '+H.ram+' GB \u00b7 bandwidth '+(H.bw?Math.round(H.bw)+' GB/s':'unknown'))+
     card(H.uni?'Usable unified memory':'Usable GPU memory',H.gpu.toFixed(1)+' GB',H.mac?(LIM==='def'?'macOS default limit (2/3 up to 36 GB, otherwise 3/4)':H.ram+' GB minus '+LIM+' GB for macOS'):esc(H.note||''))+
-    (H.uni?'':card('RAM for offloading',H.rcap.toFixed(1)+' GB','usable alongside the GPU (MoE/partial offload, CPU only) \u00b7 '+(+$('rbw').value||D.defaults.rbw)+' GB/s'))+
+    (H.uni?'':card('RAM for offloading',H.rcap.toFixed(1)+' GB','usable alongside the GPU (MoE/partial offload, CPU only) \u00b7 '+(positiveInput('rbw')||D.defaults.rbw)+' GB/s'))+
     card('Matching models',fitAll+' of '+base,'with at least one variant completely in GPU memory')+
     card('Context / efficiency',fmtN(ctx)+' tokens','efficiency '+Math.round(eff*100)+' %')+
     (H2?card('Compared with',esc(H2.n),res.filter(r=>passF(r,['fit'])&&r.c2&&r.c2.best).length+' of '+base+' models fit completely there'):'');
@@ -2068,11 +2137,11 @@ function render(resetShown){
       '<tr class="drow" data-i="'+i+'" data-k="'+esc(m.p+'|'+m.n)+'"'+(closedKeys.has(m.p+'|'+m.n)?' hidden':'')+'><td colspan="7"><div class="vwrap">'+variantInner(r)+'</div></td></tr>';
   }).join('');
   if(!list.length) $('models').tBodies[0].innerHTML='<tr><td colspan="7" style="padding:28px;text-align:center">No variants match these filters. Try a higher memory budget, a lower speed or context requirement, or reset the filters. Unknown speed/context values are excluded when their filter is active.</td></tr>';
-  const activeLimits=[positiveInput('maxmem')?'Memory ≤ '+positiveInput('maxmem')+' GiB':'',positiveInput('mintps')?'Speed ≥ '+positiveInput('mintps')+' tokens/s':'',positiveInput('minctx')?'Supported context ≥ '+fmtN(positiveInput('minctx'))+' tokens':''].filter(Boolean);
+  const activeLimits=[positiveInput('minparams')?'Model size \u2265 '+positiveInput('minparams')+'B':'',(+$('draft').value)?'Speculative decoding: '+$('draft').value+' draft tokens, '+Math.round(100*Math.min(1,positiveInput('accept')||0.7))+' % accepted':'',positiveInput('maxmem')?'Memory ≤ '+positiveInput('maxmem')+' GiB':'',positiveInput('mintps')?'Speed ≥ '+positiveInput('mintps')+' tokens/s':'',positiveInput('minctx')?'Supported context ≥ '+fmtN(positiveInput('minctx'))+' tokens':''].filter(Boolean);
   $('filter-summary').textContent=activeLimits.join(' · ')||'No memory, speed or supported-context limits. Family detection is based on model names.';
   $('csv').disabled=!list.length;
   const nt=sel.use.size?0:D.models.filter(isNonText).length;
-  $('count').textContent=fmtN(list.length)+' models shown'+(list.length>vis.length?' (first '+fmtN(vis.length)+')':'')+(nt?' \u00b7 '+nt+' non-text models hidden (choose Embedding, Image or Audio under Use case to show them)':'');
+  $('count').textContent=fmtN(list.length)+' models shown'+(list.length>vis.length?' (first '+fmtN(vis.length)+')':'')+(nt?' \u00b7 '+nt+' non-text models hidden (choose Embedding, Reranker, Image/Video/3D gen, Audio or Time series under Use case to show them)':'');
   $('more').innerHTML=list.length>vis.length?'<button id="morebtn">Show '+fmtN(Math.min(LIMIT,list.length-vis.length))+' more</button>':'';
   renderOverview(ctx,eff,f);
 }
@@ -2120,17 +2189,17 @@ function exportCsv(){
   const ctxs=[4096,8192,16384,32768,65536,131072];
   if(!ctxs.includes(D.defaults.ctx)){ctxs.push(D.defaults.ctx); ctxs.sort((a,b)=>a-b);}
   $('ctx').innerHTML=ctxs.map(c=>'<option value="'+c+'">'+fmtN(c)+' tokens</option>').join('');
-  $('ctx').value=D.defaults.ctx; $('rbw').value=D.defaults.rbw; if(D.defaults.mintps) $('mintps').value=D.defaults.mintps; $('eff').value=D.defaults.eff; $('octx').value=D.defaults.octx||'std';
+  $('ctx').value=D.defaults.ctx; $('rbw').value=D.defaults.rbw; const dv=String(D.defaults.draft||0); if(![...$('draft').options].some(o=>o.value===dv)) $('draft').insertAdjacentHTML('beforeend','<option value="'+dv+'">'+dv+' draft tokens</option>'); $('draft').value=dv; $('accept').value=D.defaults.accept; if(D.defaults.minp) $('minparams').value=D.defaults.minp; if(D.defaults.mintps) $('mintps').value=D.defaults.mintps; $('eff').value=D.defaults.eff; $('octx').value=D.defaults.octx||'std';
   const lims=['4','6','8','12']; if(LIM!=='def'&&!lims.includes(LIM)){lims.push(LIM); lims.sort((a,b)=>a-b);}
   $('uni').innerHTML=lims.map(l=>'<option value="'+l+'">RAM minus '+l+' GB for macOS</option>').join('')+'<option value="def">macOS default limit (2/3 or 3/4)</option>'; $('uni').value=LIM;
 })();
 
 const custLabel=()=>{ const i=D.hw.findIndex(x=>x.k==='custom'); if(i<0) return; const t=hwOf(i).n; ['mac','cmp'].forEach(s=>{ const o=$(s).querySelector('option[value="'+i+'"]'); if(o) o.textContent=t; }); };
 ['cvram','cram','cbw','ctf'].forEach(id=>$(id).addEventListener('input',()=>{ custLabel(); render(true); }));
-['mac','cmp','ptok','ctx','octx','eff','rbw','sort','maxmem','mintps','minctx'].forEach(id=>$(id).addEventListener('change',()=>{ if(id==='sort') sdir=1; render(true); }));
+['mac','cmp','ptok','ctx','octx','eff','rbw','draft','accept','minparams','sort','maxmem','mintps','minctx'].forEach(id=>$(id).addEventListener('change',()=>{ if(id==='sort') sdir=1; render(true); }));
 $('uni').addEventListener('change',()=>{ LIM=$('uni').value; render(true); });
 $('q').addEventListener('input',()=>render(true));
-$('reset').addEventListener('click',()=>{ $('q').value=''; ['maxmem','mintps','minctx'].forEach(id=>$(id).value=''); $('sort').value='size'; sdir=1; resetSel(); render(true); });
+$('reset').addEventListener('click',()=>{ $('q').value=''; ['maxmem','mintps','minctx','minparams'].forEach(id=>$(id).value=''); $('sort').value='size'; sdir=1; resetSel(); render(true); });
 $('fewer').addEventListener('click',()=>{ fewer=!fewer; render(false); });
 const chipClick=e=>{
   const b=e.target.closest('.chip'); if(!b) return;
@@ -2251,7 +2320,7 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
     for cand in cands:
         vs = [[v.label, round(v.size_gb, 2), v.params_b, round(frac, 3),
                (v.meta or {}).get("kv_bpt"), (v.meta or {}).get("ctx_train"), (v.meta or {}).get("swa"),
-               (None if cand.provider == "ollama" else moe_split(cand, v, frac))]
+               moe_split(cand, v, frac)]
               for v, frac in prepare_variants(cand, quant_filter)]
         if vs:
             models.append({"n": cand.name, "s": short_name(cand), "p": cand.provider,
@@ -2269,8 +2338,8 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
                                   if mine and m["n"].lower() == mine[0].lower() and abs(m["ram"] - mine[1]) < 0.5), None)
     if default is None:
         default = next((i for i, m in enumerate(hwl) if m["n"] == "M4 Max" and m["ram"] == 64), 0)
-    data = {"models": models, "hw": hwl, "mine": list(mine) if mine else None,
-            "defaults": {"only_fit": bool(getattr(args, "only_fit", False)), "mac": default, "ctx": args.context, "eff": args.efficiency, "ptok": getattr(args, "prompt_tokens", 8192), "octx": SETTINGS["ollama_ctx"], "mbits": getattr(args, "min_bits", 4) or 0, "rbw": SETTINGS.get("ram_bw") or RAM_BW_DEFAULT, "mintps": getattr(args, "min_tps", None), "gr": GPU_RESERVE_GB[SETTINGS["os"] or host_os()], "rr": os_reserve(SETTINGS["os"] or host_os()), "lim": "def" if SETTINGS["mac_limit"] == "default" else f"{os_reserve('macos'):g}"}}
+    data = {"uses": USAGE_ORDER, "nontext": sorted(NON_TEXT), "models": models, "hw": hwl, "mine": list(mine) if mine else None,
+            "defaults": {"only_fit": bool(getattr(args, "only_fit", False)), "mac": default, "ctx": args.context, "eff": args.efficiency, "ptok": getattr(args, "prompt_tokens", 8192), "octx": SETTINGS["ollama_ctx"], "mbits": getattr(args, "min_bits", 4) or 0, "rbw": SETTINGS.get("ram_bw") or RAM_BW_DEFAULT, "draft": SETTINGS.get("draft") or 0, "accept": SETTINGS.get("accept", 0.7), "dcost": SETTINGS.get("draft_cost", 0.05), "minp": getattr(args, "min_params", None), "mintps": getattr(args, "min_tps", None), "gr": GPU_RESERVE_GB[SETTINGS["os"] or host_os()], "rr": os_reserve(SETTINGS["os"] or host_os()), "lim": "def" if SETTINGS["mac_limit"] == "default" else f"{os_reserve('macos'):g}"}}
     data_json = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
 
     search_txt = esc(", ".join((args.search or []) + (args.repo or [])))
@@ -2291,6 +2360,9 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
            "<label>Compare with<select id=\"cmp\"></select></label>",
            "<label>Usable Mac memory<select id=\"uni\"></select></label>",
            "<label>RAM bandwidth for offloading (GB/s)<input id=\"rbw\" type=\"number\" min=\"1\" step=\"any\"></label>",
+           "<label>Speculative decoding / MTP<select id=\"draft\"><option value=\"0\">off</option><option value=\"1\">1 draft token</option><option value=\"2\">2 draft tokens</option>"
+           "<option value=\"4\">4 draft tokens</option><option value=\"8\">8 draft tokens</option><option value=\"16\">16 draft tokens</option></select></label>",
+           "<label>Draft acceptance rate (0-1)<input id=\"accept\" type=\"number\" min=\"0.05\" max=\"1\" step=\"0.05\"></label>",
            "<div id=\"custpanel\" style=\"display:none\"><label>Custom: VRAM (GB)<input id=\"cvram\" type=\"number\" min=\"0\" step=\"any\"></label>"
            "<label>Custom: system RAM (GB)<input id=\"cram\" type=\"number\" min=\"0\" step=\"any\"></label>"
            "<label>Custom: bandwidth (GB/s)<input id=\"cbw\" type=\"number\" min=\"0\" step=\"any\"></label>"
@@ -2299,6 +2371,7 @@ def write_html_matrix(path, args, cands, quant_filter, notes, mine, own=None):
            "<label>Sort by<select id=\"sort\"><option value=\"size\">largest variant</option>"
            "<option value=\"tps\">fastest</option><option value=\"params\">model size</option>"
            "<option value=\"dl\">most popular</option><option value=\"upd\">newest</option><option value=\"name\">Name</option></select></label>",
+           "<label>Minimum model size (B parameters)<input id=\"minparams\" type=\"number\" min=\"0\" step=\"any\" placeholder=\"Any\" aria-describedby=\"limit-help\"></label>",
            "<label>Maximum total memory (GiB)<input id=\"maxmem\" type=\"number\" min=\"0\" step=\"any\" placeholder=\"No limit\" aria-describedby=\"limit-help\"></label>",
            "<label>Minimum speed (tokens/s)<input id=\"mintps\" type=\"number\" min=\"0\" step=\"any\" placeholder=\"No minimum\" aria-describedby=\"limit-help\"></label>",
            "<label>Minimum supported context<select id=\"minctx\" aria-describedby=\"limit-help\"><option value=\"\">Any / unknown</option>"
@@ -2458,6 +2531,7 @@ def run_advisor(args, cands, quant_filter):
           "for several cards the bandwidth of one card is used.")
 
 
+DOMAINS = ["medical", "finance", "legal", "science", "bio", "rerank"]   # domain models (fine-tunes), searched with --all
 FAMILIES = ["llama", "qwen", "gemma", "mistral", "deepseek", "phi", "gpt-oss", "glm", "granite",
             "olmo", "nemotron", "smollm", "command-r", "lfm"]
 
@@ -2529,6 +2603,16 @@ def main():
     ap.add_argument("--ram-bandwidth", type=float, metavar="GB/s",
                     help=f"System RAM bandwidth for offloading speeds (default {RAM_BW_DEFAULT:g}; dual-channel DDR5 about 60-90, "
                          "workstation/server with 4-12 channels 150-500)")
+    ap.add_argument("--min-params", type=float, metavar="B",
+                    help="Only models with at least B billion parameters (also preset in the HTML report)")
+    ap.add_argument("--draft-tokens", type=int, default=0, metavar="N",
+                    help="Speculative decoding / MTP: draft tokens per step (e.g. 4 or 8; default 0 = off)")
+    ap.add_argument("--accept-rate", type=float, default=0.7, metavar="A",
+                    help="Speculative decoding: share of draft tokens the large model accepts (default 0.7; "
+                         "code/structured text often higher, creative text lower)")
+    ap.add_argument("--draft-cost", type=float, default=0.05, metavar="C",
+                    help="Cost of one draft step relative to the large model (default 0.05 = MTP head; "
+                         "separate draft model: its size / main model size)")
     ap.add_argument("--advisor", action="store_true",
                     help="Reverse question: smallest Mac and smallest NVIDIA preset each model runs on completely")
     ap.add_argument("--min-tps", type=float, metavar="T/S", help="Advisor/report: minimum tokens/s")
@@ -2537,15 +2621,22 @@ def main():
     ap.add_argument("--all-macs", action="store_true",
                     help="Compare models against all Mac chips and memory sizes (M1 to M5)")
     args = ap.parse_args()
-    import math
-    for name in ("context", "limit", "top", "ram", "bandwidth", "cache_ttl"):
+    for name in ("context", "limit", "top", "ram", "bandwidth", "cache_ttl", "ram_bandwidth"):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value <= 0):
             ap.error(f"--{name.replace('_', '-')} must be positive and finite")
-    for name in ("vram", "reserve"):
+    if args.draft_tokens < 0 or args.draft_tokens > 32:
+        ap.error("--draft-tokens must be between 0 and 32")
+    if not math.isfinite(args.accept_rate) or not 0 < args.accept_rate <= 1:
+        ap.error("--accept-rate must be greater than 0 and at most 1")
+    if not math.isfinite(args.draft_cost) or not 0 <= args.draft_cost < 1:
+        ap.error("--draft-cost must be at least 0 and below 1")
+    for name in ("vram", "reserve", "min_tps", "min_bits", "min_params"):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value < 0):
-            ap.error(f"--{name} must be nonnegative and finite")
+            ap.error(f"--{name.replace('_', '-')} must be nonnegative and finite")
+    if args.ca_bundle and not os.path.isfile(args.ca_bundle):
+        ap.error(f"--ca-bundle: file not found: {args.ca_bundle}")
     if args.efficiency is not None and (not math.isfinite(args.efficiency) or not 0 < args.efficiency <= 1):
         ap.error("--efficiency must be greater than 0 and at most 1")
     for name in ("tflops", "prompt_tokens"):
@@ -2554,7 +2645,8 @@ def main():
             ap.error(f"--{name.replace('_', '-')} must be positive and finite")
     global USE_META
     USE_META = not args.no_meta
-    SETTINGS.update(os=args.os, reserve=args.reserve, mac_limit=args.mac_limit, ollama_ctx=args.ollama_ctx, live=args.live, ram_bw=args.ram_bandwidth)
+    SETTINGS.update(os=args.os, reserve=args.reserve, mac_limit=args.mac_limit, ollama_ctx=args.ollama_ctx, live=args.live, ram_bw=args.ram_bandwidth,
+                    draft=args.draft_tokens, accept=args.accept_rate, draft_cost=args.draft_cost)
     cache_setup(not args.no_cache, args.cache_ttl, args.refresh)
     ssl_setup(args.ca_bundle)
     if SSL_NOTE:
@@ -2580,7 +2672,7 @@ def main():
 
     if args.top:
         if not args.search and not args.repo:
-            args.search = [""] + FAMILIES   # empty search = most popular of the provider, plus the most important families
+            args.search = [""] + FAMILIES + DOMAINS   # most popular of the provider, the important families and domains
         args.limit = args.top
     if not args.search and not args.repo and not args.calibrate:
         ap.error("Please specify --search, --repo or --all")
@@ -2652,19 +2744,26 @@ def main():
             todo.append((default_provider, r, None, None))
 
     seen = {(t[0], t[1]) for t in todo}
-    jobs = [(term, p) for term in args.search or [] for p in selected]
+    jobs = [(term, p, None) for term in args.search or [] for p in selected]
+    if args.top:   # second pass per family: trending (HF) / newest (Ollama), so new releases are not missed
+        jobs += [(term, p, {"hf": "trendingScore", "ollama": "newest"}[p])
+                 for term in args.search or [] for p in selected if p in ("hf", "ollama")]
 
     def run_search(job):
-        term, p = job
+        term, p, mode = job
         try:
+            if mode:
+                return PROVIDERS[p][1](term, args.limit, mode), None
             return PROVIDERS[p][1](term, args.limit), None
         except Exception as exc:
             return [], exc
 
     with ThreadPoolExecutor(max_workers=6) as pool:   # result order is preserved
         found = list(pool.map(run_search, jobs))
-    net_errors = [repr(exc) for _, exc in found if exc]
-    for (term, p), (hits, exc) in zip(jobs, found):
+    net_errors = [repr(exc) for (_, _, mode), (_, exc) in zip(jobs, found) if exc and not mode]
+    for (term, p, mode), (hits, exc) in zip(jobs, found):
+        if exc and mode:   # the extra trending/newest pass is optional: no message
+            continue
         if exc:
             msg = f"[{PROVIDERS[p][0]}] search '{term}' failed: {exc}"
             print("\n" + msg)
@@ -2695,6 +2794,16 @@ def main():
     if hint:
         notes.append(hint)
         print("\n" + hint)
+    if args.min_params:
+        def model_params(c):
+            ps = [v.params_b for v in c.variants if v.params_b] or [params_from_name(c.name.split("/")[-1]) or 0]
+            return max(ps)
+        before = len(cands)
+        cands = [c for c in cands if c.error or model_params(c) >= args.min_params]
+        if before - len(cands):
+            msg = f"{before - len(cands)} models below {args.min_params:g}B parameters (or with unknown size) hidden (--min-params)."
+            notes.append(msg)
+            print("\n" + msg)
     cands, hidden = dedupe_mirrors(cands)
     if hidden:
         notes.append(f"{hidden} repeated provider/repository entries were hidden.")
@@ -2768,6 +2877,9 @@ def main():
           "[+ ] Partial offload (slower) | [~ ] CPU only | [--] Too large")
     if not hw.unified:
         print(f"Offload speeds assume {SETTINGS.get('ram_bw') or RAM_BW_DEFAULT:g} GB/s RAM bandwidth (--ram-bandwidth).")
+    if args.draft_tokens:
+        print(f"Tokens/s include speculative decoding: {args.draft_tokens} draft tokens, acceptance {args.accept_rate:.0%}, "
+              f"draft cost {args.draft_cost:g} (dense model x{spec_factor(1.0, None):.2f}; MoE models gain less).")
     print("Need = file size + estimated KV cache + about 1 GB overhead.")
     if bandwidth:
         print("Tokens/s = rough upper bound: efficiency x bandwidth / active weights (* = MoE, real values usually lower).")
